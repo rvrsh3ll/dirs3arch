@@ -1,0 +1,1090 @@
+import re
+from unittest import TestCase
+from unittest.mock import Mock, patch
+
+from lib.connection.native import (
+    NativeHTTPBackend,
+    NativeRequester,
+)
+from lib.core.filter_config import FilterConfig
+from lib.core.request_config import RequestConfig
+from lib.core.option_defaults import default_options
+from lib.core.exceptions import RequestException
+from lib.core.native_runtime import NATIVE_EXTENSION_VERSION
+from lib.core.wordlist_backend import NativeWordlistChunk
+
+
+class FakeNativeResult:
+    path = "missing%20page"
+    status = 404
+    length = 64
+    elapsed_ms = 125.0
+    error = None
+    filtered = True
+    filter_reason = "advanced_filter"
+    headers = [("content-type", "text/plain")]
+    body = []
+    body_complete = True
+    history = ["https://example.com/before"]
+    final_url = "https://example.com/missing%20page"
+
+
+class HistoryTrackingNativeResult(FakeNativeResult):
+    def __init__(self, history):
+        self._history = history
+        self.history_reads = 0
+
+    @property
+    def history(self):
+        self.history_reads += 1
+        return self._history
+
+
+class FakeNativeEngine:
+    def __init__(self, results=None, **config):
+        self.config = config
+        self.calls = []
+        self.chunk_calls = []
+        self.owned_chunk_calls = []
+        self.cancelled = False
+        self.results = results
+
+    def scan(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return self.results if self.results is not None else [FakeNativeResult()]
+
+    def scan_chunks(self, base_url, paths, callback, **kwargs):
+        self.chunk_calls.append(((base_url, paths, callback), kwargs))
+        results = self.results if self.results is not None else [FakeNativeResult()]
+        callback(0, len(paths), results)
+        return len(paths)
+
+    def scan_owned_chunks(self, base_url, chunk, callback, **kwargs):
+        self.owned_chunk_calls.append(((base_url, chunk, callback), kwargs))
+        results = self.results if self.results is not None else [FakeNativeResult()]
+        callback(0, chunk.len(), results)
+        return chunk.len()
+
+    def cancel(self):
+        self.cancelled = True
+
+    def reset_cancel(self):
+        self.cancelled = False
+
+
+class FakeNativeSession:
+    def __init__(self):
+        self.rate_value = 0
+
+    def rate(self):
+        return self.rate_value
+
+
+class FakeNativeModule:
+    __version__ = NATIVE_EXTENSION_VERSION
+
+    def __init__(self, results=None):
+        self.engines = []
+        self.filter_configs = []
+        self.sessions = []
+        self.results = results
+
+    def NativeHttpSession(self):
+        session = FakeNativeSession()
+        self.sessions.append(session)
+        return session
+
+    def NativeHttpEngine(self, **config):
+        engine = FakeNativeEngine(self.results, **config)
+        self.engines.append(engine)
+        return engine
+
+    def NativeFilterConfig(self, **config):
+        filter_config = type("FakeNativeFilterConfig", (), {"config": config})()
+        self.filter_configs.append(filter_config)
+        return filter_config
+
+
+class IndexedNativeResult:
+    def __init__(self, request_index, *, filtered, status=404, error=None):
+        self.request_index = request_index
+        self.path = f"path-{request_index}"
+        self.status = status
+        self.length = 2
+        self.elapsed_ms = 1.0
+        self.error = error
+        self.filtered = filtered
+        self.filter_reason = "advanced_filter" if filtered else None
+        self.headers = [("content-type", "text/plain")]
+        self.body = [] if filtered else [111, 107]
+        self.body_complete = True
+        self.history = []
+        self.final_url = f"https://example.com/{self.path}"
+
+
+class FakeOwnedChunk:
+    def __init__(self, paths):
+        self.paths = paths
+        self.path_calls = []
+
+    def len(self):
+        return len(self.paths)
+
+    def path_at(self, index):
+        self.path_calls.append(index)
+        return self.paths[index]
+
+    def to_list(self):
+        return list(self.paths)
+
+
+class TestNativeHTTPBackend(TestCase):
+    def setUp(self):
+        self.options = default_options()
+        self.options.update(
+            {
+                "thread_count": 7,
+                "timeout": 3.5,
+                "max_rate": 23,
+                "delay": 0.125,
+                "http_method": "GET",
+                "data": None,
+                "headers": {"user-agent": "dirsearch-test"},
+                "auth": None,
+                "auth_type": None,
+                "proxies": ["127.0.0.1:8080"],
+                "proxy_auth": "user:password",
+                "cert_file": None,
+                "key_file": None,
+                "random_agents": False,
+                "network_interface": None,
+                "max_retries": 2,
+                "follow_redirects": False,
+                "include_status_codes": {200, 204},
+                "exclude_status_codes": {500},
+                "minimum_response_size": 10,
+                "maximum_response_size": 200,
+                "matcher_mode": "and",
+                "filter_mode": "or",
+                "match_status_codes": {200},
+                "filter_status_codes": {404},
+                "match_sizes": ((10, 100),),
+                "filter_sizes": ((0, 0),),
+                "match_words": ((2, 10),),
+                "filter_words": ((0, 0),),
+                "match_lines": ((1, 5),),
+                "filter_lines": ((0, 0),),
+                "match_regex": "admin",
+                "filter_regex": "not found",
+                "match_headers": ["etag: w/"],
+                "filter_headers": ["x-cache: fallback"],
+                "match_header_regex": "etag: .+",
+                "filter_header_regex": "x-cache: fallback-[0-9]+",
+                "match_time": ((">", 100.0),),
+                "filter_time": ((">", 2000.0),),
+            }
+        )
+
+    def test_rejects_an_incompatible_native_extension(self):
+        fake_native = FakeNativeModule()
+        fake_native.__version__ = "0.2.7"
+
+        with (
+            patch.dict("sys.modules", {"dirsearch_native": fake_native}),
+            self.assertRaisesRegex(
+                RequestException,
+                rf"expected {re.escape(NATIVE_EXTENSION_VERSION)}, found 0\.2\.7",
+            ),
+        ):
+            NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+
+    def test_engine_rebuild_reuses_explicit_native_session(self):
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            backend = NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            first_engine = backend._get_engine()
+            backend.set_origin_authentication("bearer", "target-token")
+            backend._get_engine()
+
+        self.assertIs(first_engine.config["session"], fake_native.sessions[0])
+        self.assertIs(
+            fake_native.engines[1].config["session"],
+            fake_native.sessions[0],
+        )
+        self.assertEqual(len(fake_native.sessions), 1)
+
+    def test_native_replay_backend_shares_explicit_native_session(self):
+        self.options["proxies"] = []
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            requester = NativeRequester(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            requester.set_url("https://example.com/")
+            requester.set_query("scope=one")
+            requester.request("first")
+            requester.request("second", proxy="http://replay.test:8080")
+
+        self.assertIs(
+            fake_native.engines[1].config["session"],
+            fake_native.engines[0].config["session"],
+        )
+        self.assertEqual(len(fake_native.sessions), 1)
+
+    def test_engine_receives_interface_and_normalized_ip_overrides(self):
+        self.options["proxies"] = []
+        self.options["network_interface"] = "lo"
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            requester = NativeRequester(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            requester.set_ip("SECOND.EXAMPLE.", 443, "::1")
+            requester.set_ip("First.Example", 80, "127.0.0.1")
+            requester.set_url("http://first.example/")
+            requester.request("admin")
+
+        config = fake_native.engines[0].config
+        self.assertEqual(config["network_interface"], "lo")
+        self.assertEqual(
+            config["connection_overrides"],
+            [
+                ("first.example", 80, "127.0.0.1"),
+                ("second.example", 443, "::1"),
+            ],
+        )
+
+    def test_ip_override_rebuilds_an_existing_engine(self):
+        self.options["proxies"] = []
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            requester = NativeRequester(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            requester.set_url("http://example.com/")
+            requester.request("first")
+            requester.set_ip("example.com", 80, "127.0.0.1")
+            requester.request("second")
+
+        self.assertEqual(len(fake_native.engines), 2)
+        self.assertEqual(fake_native.engines[0].config["connection_overrides"], [])
+        self.assertEqual(
+            fake_native.engines[1].config["connection_overrides"],
+            [("example.com", 80, "127.0.0.1")],
+        )
+
+    def test_replay_proxy_keeps_interface_without_rerouting_the_proxy(self):
+        self.options["proxies"] = []
+        self.options["network_interface"] = "lo"
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            requester = NativeRequester(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            requester.set_ip("example.com", 443, "192.0.2.10")
+            requester.set_url("https://example.com/")
+            requester.request("admin", proxy="http://replay.test:8080")
+
+        config = fake_native.engines[0].config
+        self.assertEqual(config["network_interface"], "lo")
+        self.assertEqual(config["connection_overrides"], [])
+
+    def test_first_replay_request_does_not_build_an_origin_engine_for_state(self):
+        self.options["proxies"] = []
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            requester = NativeRequester(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            requester.set_url("https://example.com/")
+            requester.request("first", proxy="http://replay.test:8080")
+
+        self.assertEqual(len(fake_native.engines), 1)
+        self.assertIs(fake_native.engines[0].config["session"], fake_native.sessions[0])
+
+    def test_disabled_redirects_do_not_materialize_native_history(self):
+        result = HistoryTrackingNativeResult(
+            ["https://example.com/unexpected-redirect"]
+        )
+        fake_native = FakeNativeModule([result])
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            backend = NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            response = list(backend.scan("https://example.com/", ["admin"]))[0][1]
+
+        self.assertEqual(result.history_reads, 0)
+        self.assertEqual(response.history, [])
+
+    def test_enabled_redirects_materialize_native_history_once(self):
+        self.options["follow_redirects"] = True
+        history = ["https://example.com/before"]
+        result = HistoryTrackingNativeResult(history)
+        fake_native = FakeNativeModule([result])
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            backend = NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            response = list(backend.scan("https://example.com/", ["admin"]))[0][1]
+
+        self.assertEqual(result.history_reads, 1)
+        self.assertEqual(response.history, history)
+
+    def test_scan_reuses_native_filter_config_and_builds_filtered_response(self):
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            backend = NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            rows = list(backend.scan("https://example.com/", ["missing page"]))
+
+        self.assertEqual(len(rows), 1)
+        path, response, error = rows[0]
+        self.assertEqual(path, "missing page")
+        self.assertIsNone(error)
+        self.assertTrue(response.filtered)
+        self.assertEqual(response.filter_reason, "advanced_filter")
+        self.assertEqual(response.body, b"")
+        self.assertEqual(response.length, 64)
+        self.assertEqual(response.history, [])
+
+        self.assertEqual(len(fake_native.engines), 1)
+        engine = fake_native.engines[0]
+        self.assertEqual(engine.config["concurrency"], 7)
+        self.assertEqual(engine.config["timeout_secs"], 3.5)
+        self.assertEqual(engine.config["max_rate"], 23)
+        self.assertEqual(engine.config["delay_secs"], 0.125)
+        self.assertEqual(engine.config["max_redirects"], 30)
+        self.assertEqual(engine.config["auth_type"], "")
+        self.assertEqual(engine.config["auth_credential"], "")
+        self.assertEqual(
+            engine.config["proxies"],
+            ["http://user:password@127.0.0.1:8080"],
+        )
+
+        args, kwargs = engine.calls[0]
+        self.assertEqual(args[:2], ("https://example.com/", ["missing page"]))
+        self.assertEqual(kwargs["query"], "")
+        self.assertEqual(len(fake_native.filter_configs), 1)
+        filter_options = fake_native.filter_configs[0].config
+        self.assertIs(kwargs["filter_config"], fake_native.filter_configs[0])
+        self.assertEqual(filter_options["include_status_codes"], [200, 204])
+        self.assertEqual(filter_options["exclude_status_codes"], [500])
+        self.assertEqual(filter_options["minimum_response_size"], 10)
+        self.assertEqual(filter_options["maximum_response_size"], 200)
+        self.assertEqual(filter_options["matcher_mode"], "and")
+        self.assertEqual(filter_options["filter_mode"], "or")
+        self.assertEqual(filter_options["match_status_codes"], [200])
+        self.assertEqual(filter_options["filter_status_codes"], [404])
+        self.assertEqual(filter_options["match_sizes"], [(10, 100)])
+        self.assertEqual(filter_options["filter_regex"], "not found")
+        self.assertEqual(filter_options["match_headers"], ["etag: w/"])
+        self.assertEqual(filter_options["filter_headers"], ["x-cache: fallback"])
+        self.assertEqual(filter_options["match_header_regex"], "etag: .+")
+        self.assertEqual(
+            filter_options["filter_header_regex"], "x-cache: fallback-[0-9]+"
+        )
+        self.assertEqual(filter_options["match_time"], [(">", 100.0)])
+
+    def test_requester_reports_the_shared_native_request_rate(self):
+        self.options["proxies"] = []
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            requester = NativeRequester(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            self.assertEqual(requester.rate, 0)
+            requester.set_url("https://example.com/")
+            requester.request("admin")
+            fake_native.sessions[0].rate_value = 19
+
+        self.assertEqual(requester.rate, 19)
+
+    def test_first_replay_request_is_included_in_the_shared_rate(self):
+        self.options["proxies"] = []
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            requester = NativeRequester(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            requester.set_url("https://example.com/")
+            requester.request("admin", proxy="http://replay.test:8080")
+            fake_native.sessions[0].rate_value = 1
+
+        self.assertEqual(requester.rate, 1)
+
+    def test_engine_receives_method_body_and_inferred_content_type(self):
+        self.options["http_method"] = "PATCH"
+        self.options["data"] = '{"value":"\u00e9"}\r\n'
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            backend = NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            list(backend.scan("https://example.com/", ["admin"]))
+
+        config = fake_native.engines[0].config
+        self.assertEqual(config["method"], "PATCH")
+        self.assertEqual(config["body"], '{"value":"\u00e9"}\r\n'.encode())
+        self.assertIn(("content-type", "application/json"), config["headers"])
+
+    def test_engine_receives_authentication_as_native_configuration(self):
+        for auth_type, credential in (
+            ("basic", "user:password:tail"),
+            ("bearer", "opaque-token"),
+            ("jwt", "header.payload.signature"),
+            ("digest", "user:password"),
+        ):
+            with self.subTest(auth_type=auth_type):
+                self.options["auth"] = credential
+                self.options["auth_type"] = auth_type
+                self.options["headers"]["Authorization"] = "Bearer explicit-header"
+                fake_native = FakeNativeModule()
+
+                with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+                    list(NativeHTTPBackend(
+                        RequestConfig.from_options(self.options),
+                        filter_config=FilterConfig.from_options(self.options),
+                    ).scan("https://example.com/", ["admin"]))
+
+                config = fake_native.engines[0].config
+                self.assertEqual(config["auth_type"], auth_type)
+                self.assertEqual(config["auth_credential"], credential)
+                self.assertFalse(
+                    any(
+                        name.lower() == "authorization"
+                        for name, _value in config["headers"]
+                    )
+                )
+
+    def test_target_authentication_is_restored_without_cross_target_leakage(self):
+        self.options["auth"] = "configured-token"
+        self.options["auth_type"] = "bearer"
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            requester = NativeRequester(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            requester.set_url("https://example.com/")
+            requester.set_auth("basic", "target-user:target-password")
+            requester.request("first")
+            requester.reset_auth()
+            requester.request("second")
+
+        self.assertEqual(
+            [
+                (engine.config["auth_type"], engine.config["auth_credential"])
+                for engine in fake_native.engines
+            ],
+            [
+                ("basic", "target-user:target-password"),
+                ("bearer", "configured-token"),
+            ],
+        )
+
+    def test_reset_auth_restores_explicit_authorization_header(self):
+        self.options["headers"]["Authorization"] = "Bearer explicit-header"
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            requester = NativeRequester(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            requester.set_url("https://example.com/")
+            requester.set_auth("basic", "target-user:target-password")
+            requester.request("first")
+            requester.reset_auth()
+            requester.request("second")
+
+        self.assertNotIn(
+            ("Authorization", "Bearer explicit-header"),
+            fake_native.engines[0].config["headers"],
+        )
+        self.assertIn(
+            ("Authorization", "Bearer explicit-header"),
+            fake_native.engines[1].config["headers"],
+        )
+
+    def test_replay_proxy_uses_current_origin_authentication(self):
+        self.options["auth"] = "replay-token"
+        self.options["auth_type"] = "jwt"
+        self.options["proxy_auth"] = None
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            requester = NativeRequester(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            requester.set_url("https://example.com/")
+            requester.request("admin", proxy="http://replay.invalid:8080")
+
+        config = fake_native.engines[0].config
+        self.assertEqual(config["proxies"], ["http://replay.invalid:8080"])
+        self.assertEqual(config["auth_type"], "jwt")
+        self.assertEqual(config["auth_credential"], "replay-token")
+
+    def test_native_requester_passes_ntlm_to_the_native_engine(self):
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            requester = NativeRequester(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            requester.set_url("https://example.com/")
+            requester.set_auth("ntlm", "domain\\user:password")
+            requester.request("protected")
+
+        self.assertEqual(len(fake_native.engines), 1)
+        config = fake_native.engines[0].config
+        self.assertEqual(config["auth_type"], "ntlm")
+        self.assertEqual(config["auth_credential"], "domain\\user:password")
+        self.assertFalse(
+            any(
+                name.lower() == "authorization"
+                for name, _value in config["headers"]
+            )
+        )
+
+    def test_engine_receives_client_identity_bytes(self):
+        self.options["cert_file"] = "client-cert.pem"
+        self.options["key_file"] = "client-key.pem"
+        fake_native = FakeNativeModule()
+
+        with (
+            patch.dict("sys.modules", {"dirsearch_native": fake_native}),
+            patch(
+                "lib.connection.native.FileUtils.read_bytes",
+                side_effect=[b"CERTIFICATE BYTES", b"PRIVATE KEY BYTES"],
+            ) as read_bytes,
+        ):
+            backend = NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            list(backend.scan("https://example.com/", ["admin"]))
+            list(backend.scan("https://example.com/", ["second"]))
+
+        self.assertEqual(
+            [item.args for item in read_bytes.call_args_list],
+            [
+                ("client-cert.pem",),
+                ("client-key.pem",),
+            ],
+        )
+        config = fake_native.engines[0].config
+        self.assertEqual(config["client_certificate"], b"CERTIFICATE BYTES")
+        self.assertEqual(config["client_key"], b"PRIVATE KEY BYTES")
+
+    def test_engine_receives_random_agents_without_shared_user_agent_header(self):
+        self.options["random_agents"] = True
+        self.options["headers"]["x-scan"] = "native"
+        fake_native = FakeNativeModule()
+
+        with (
+            patch.dict("sys.modules", {"dirsearch_native": fake_native}),
+            patch(
+                "lib.connection.native.FileUtils.get_lines",
+                return_value=["agent-one", "agent-two"],
+            ) as get_lines,
+        ):
+            backend = NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            list(backend.scan("https://example.com/", ["admin"]))
+            list(backend.scan("https://example.com/", ["second"]))
+
+        get_lines.assert_called_once()
+        self.assertEqual(len(fake_native.engines), 1)
+        config = fake_native.engines[0].config
+        self.assertEqual(
+            config["random_user_agents"], ["agent-one", "agent-two"]
+        )
+        self.assertEqual(config["headers"], [("x-scan", "native")])
+
+    def test_random_agent_list_read_failure_is_a_request_error(self):
+        self.options["random_agents"] = True
+
+        with (
+            patch.dict(
+                "sys.modules", {"dirsearch_native": FakeNativeModule()}
+            ),
+            patch(
+                "lib.connection.native.FileUtils.get_lines",
+                side_effect=OSError("agent list disappeared"),
+            ),
+            self.assertRaisesRegex(
+                RequestException,
+                "Could not read random User-Agent list: agent list disappeared",
+            ),
+        ):
+            NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+
+    def test_incomplete_client_identity_fails_before_engine_creation(self):
+        self.options["cert_file"] = "client-cert.pem"
+        fake_native = FakeNativeModule()
+
+        with (
+            patch.dict("sys.modules", {"dirsearch_native": fake_native}),
+            self.assertRaisesRegex(
+                RequestException,
+                "--cert-file and --key-file must be used together",
+            ),
+        ):
+            list(NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            ).scan("https://example.com/", ["admin"]))
+
+        self.assertEqual(fake_native.engines, [])
+
+    def test_empty_client_identity_files_fail_closed(self):
+        self.options["cert_file"] = "client-cert.pem"
+        self.options["key_file"] = "client-key.pem"
+
+        for file_contents in (
+            [b"", b"PRIVATE KEY BYTES"],
+            [b"CERTIFICATE BYTES", b""],
+            [b"", b""],
+        ):
+            with self.subTest(file_contents=file_contents):
+                fake_native = FakeNativeModule()
+                with (
+                    patch.dict("sys.modules", {"dirsearch_native": fake_native}),
+                    patch(
+                        "lib.connection.native.FileUtils.read_bytes",
+                        side_effect=file_contents,
+                    ),
+                    self.assertRaisesRegex(
+                        RequestException,
+                        "Client certificate and private key files must not be empty",
+                    ),
+                ):
+                    NativeHTTPBackend(
+                        RequestConfig.from_options(self.options),
+                        filter_config=FilterConfig.from_options(self.options),
+                    )
+
+                self.assertEqual(fake_native.engines, [])
+
+    def test_client_identity_read_failures_are_request_errors(self):
+        self.options["cert_file"] = "client-cert.pem"
+        self.options["key_file"] = "client-key.pem"
+
+        for read_effects in (
+            [OSError("certificate disappeared")],
+            [b"CERTIFICATE BYTES", OSError("private key disappeared")],
+        ):
+            with self.subTest(read_effects=read_effects):
+                with (
+                    patch.dict(
+                        "sys.modules", {"dirsearch_native": FakeNativeModule()}
+                    ),
+                    patch(
+                        "lib.connection.native.FileUtils.read_bytes",
+                        side_effect=read_effects,
+                    ),
+                    self.assertRaisesRegex(
+                        RequestException,
+                        "Could not read client certificate or private key: ",
+                    ),
+                ):
+                    NativeHTTPBackend(
+                        RequestConfig.from_options(self.options),
+                        filter_config=FilterConfig.from_options(self.options),
+                    )
+
+    def test_invalid_client_identity_from_native_engine_is_a_request_error(self):
+        self.options["cert_file"] = "client-cert.pem"
+        self.options["key_file"] = "client-key.pem"
+        fake_native = FakeNativeModule()
+        fake_native.NativeHttpEngine = Mock(
+            side_effect=RuntimeError(
+                "Invalid client certificate or private key: builder error"
+            )
+        )
+
+        with (
+            patch.dict("sys.modules", {"dirsearch_native": fake_native}),
+            patch(
+                "lib.connection.native.FileUtils.read_bytes",
+                side_effect=[b"INVALID CERTIFICATE", b"SECRET PRIVATE KEY"],
+            ),
+            self.assertRaisesRegex(
+                RequestException,
+                "Invalid client certificate or private key: builder error",
+            ) as raised,
+        ):
+            list(NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            ).scan("https://example.com/", ["admin"]))
+
+        self.assertNotIn("SECRET PRIVATE KEY", str(raised.exception))
+
+    def test_explicit_content_type_is_preserved_for_binary_body(self):
+        self.options["http_method"] = "POST"
+        self.options["data"] = bytes(range(256))
+        self.options["headers"]["Content-Type"] = "application/octet-stream"
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            backend = NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            list(backend.scan("https://example.com/", ["upload"]))
+
+        config = fake_native.engines[0].config
+        self.assertEqual(config["body"], bytes(range(256)))
+        self.assertEqual(
+            [
+                value
+                for name, value in config["headers"]
+                if name.lower() == "content-type"
+            ],
+            ["application/octet-stream"],
+        )
+
+    def test_scan_chunks_deliver_compact_ranges_before_returning(self):
+        fake_native = FakeNativeModule(
+            [
+                IndexedNativeResult(1, filtered=False, status=200),
+                IndexedNativeResult(2, filtered=True),
+            ]
+        )
+        received = []
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            backend = NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            processed_count = backend.scan_chunks(
+                "https://example.com/",
+                ["zero", "one", "two"],
+                received.append,
+            )
+
+        self.assertEqual(processed_count, 3)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(
+            (received[0].start_index, received[0].end_index),
+            (0, 3),
+        )
+        self.assertEqual(
+            [(event.request_index, event.path) for event in received[0].events],
+            [(1, "one")],
+        )
+        engine = fake_native.engines[0]
+        self.assertEqual(engine.calls, [])
+        self.assertEqual(len(engine.chunk_calls), 1)
+
+    def test_scan_chunks_keep_owned_paths_in_rust(self):
+        fake_native = FakeNativeModule(
+            [IndexedNativeResult(1, filtered=False, status=200)]
+        )
+        native_chunk = FakeOwnedChunk(["zero", "one", "two"])
+        paths = NativeWordlistChunk(native_chunk)
+        received = []
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            backend = NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            backend.scan_chunks(
+                "https://example.com/",
+                paths,
+                received.append,
+            )
+
+        engine = fake_native.engines[0]
+        self.assertEqual(engine.chunk_calls, [])
+        self.assertEqual(len(engine.owned_chunk_calls), 1)
+        self.assertIs(engine.owned_chunk_calls[0][0][1], native_chunk)
+        self.assertEqual(native_chunk.path_calls, [1])
+        self.assertEqual(received[0].events[0].path, "one")
+
+    def test_scan_chunks_preserve_proxy_authentication_errors(self):
+        fake_native = FakeNativeModule(
+            [IndexedNativeResult(0, filtered=True, status=407)]
+        )
+        received = []
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            backend = NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            backend.scan_chunks(
+                "https://example.com/",
+                ["admin"],
+                received.append,
+            )
+
+        chunk = received[0]
+        self.assertEqual(chunk.end_index, 1)
+        self.assertEqual(len(chunk.events), 1)
+        self.assertIsNone(chunk.events[0].response)
+        self.assertEqual(str(chunk.events[0].error), "Proxy authentication required")
+
+    def test_native_requester_uses_unfiltered_native_engine_for_calibration(self):
+        fake_native = FakeNativeModule(
+            [IndexedNativeResult(0, filtered=False, status=404)]
+        )
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            requester = NativeRequester(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            requester.set_url("https://example.com/")
+            requester.set_query("scope=one")
+            response = requester.request("missing page")
+
+        self.assertEqual(response.status, 404)
+        args, kwargs = fake_native.engines[0].calls[0]
+        self.assertEqual(args[:2], ("https://example.com/", ["missing page"]))
+        self.assertEqual(kwargs["query"], "scope=one")
+        self.assertNotIn("compact_filtered", kwargs)
+        self.assertIs(kwargs["filter_config"], fake_native.filter_configs[0])
+
+    def test_response_url_uses_the_target_prepared_by_native(self):
+        result = FakeNativeResult()
+        result.path = "missing%20page?scope=one"
+        fake_native = FakeNativeModule([result])
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            backend = NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            rows = list(
+                backend.scan(
+                    "https://example.com/",
+                    ["different raw path"],
+                    "scope=one",
+                )
+            )
+
+        self.assertEqual(
+            rows[0][1].url,
+            "https://example.com/missing%20page?scope=one",
+        )
+
+    def test_native_requester_defers_extension_import_until_first_request(self):
+        with patch.dict("sys.modules", {"dirsearch_native": None}):
+            requester = NativeRequester(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            requester.set_url("https://example.com/")
+
+            with self.assertRaisesRegex(RequestException, "Native Rust backend"):
+                requester.request("admin")
+
+    def test_native_requester_close_cancels_and_releases_persistent_engine(self):
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            requester = NativeRequester(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            backend = requester.get_backend()
+            list(backend.scan("https://example.com/", ["admin"]))
+            engine = fake_native.engines[0]
+
+            requester.close()
+            requester.close()
+
+        self.assertTrue(engine.cancelled)
+        self.assertIsNone(backend._engine)
+        self.assertIsNone(requester.backend)
+
+    def test_proxy_urls_encode_reserved_credentials(self):
+        self.options["proxy_auth"] = "proxy/user:p@ss/word?#%:tail"
+
+        self.assertEqual(
+            NativeHTTPBackend._proxy_urls(RequestConfig.from_options(self.options)),
+            [
+                "http://proxy%2Fuser:p%40ss%2Fword%3F%23%25%3Atail"
+                "@127.0.0.1:8080"
+            ],
+        )
+
+    def test_proxy_urls_preserve_every_supported_proxy_scheme(self):
+        self.options["proxy_auth"] = None
+        self.options["proxies"] = [
+            "proxy.example:8080",
+            "https://proxy.example:8443",
+            "socks4://proxy.example:1080",
+            "socks4a://proxy.example:1080",
+            "socks5://proxy.example:1080",
+            "socks5h://proxy.example:1080",
+        ]
+
+        self.assertEqual(
+            NativeHTTPBackend._proxy_urls(RequestConfig.from_options(self.options)),
+            [
+                "http://proxy.example:8080",
+                "https://proxy.example:8443",
+                "socks4://proxy.example:1080",
+                "socks4a://proxy.example:1080",
+                "socks5://proxy.example:1080",
+                "socks5h://proxy.example:1080",
+            ],
+        )
+
+    def test_socks5_proxy_urls_encode_handshake_credentials(self):
+        self.options["proxy_auth"] = "proxy/user:p@ss/word?#%:tail"
+        self.options["proxies"] = ["socks5h://proxy.example:1080"]
+
+        self.assertEqual(
+            NativeHTTPBackend._proxy_urls(RequestConfig.from_options(self.options)),
+            [
+                "socks5h://proxy%2Fuser:p%40ss%2Fword%3F%23%25%3Atail"
+                "@proxy.example:1080"
+            ],
+        )
+
+    def test_proxy_override_uses_the_same_socks_normalization(self):
+        self.options["proxy_auth"] = "user:password"
+        self.options["proxies"] = []
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            backend = NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+                proxy_override="socks5://proxy.example:1080"
+            )
+            list(backend.scan("https://example.com/", ["admin"]))
+
+        self.assertEqual(
+            fake_native.engines[0].config["proxies"],
+            ["socks5://user:password@proxy.example:1080"],
+        )
+
+    def test_socks4_proxy_credentials_are_not_silently_ignored(self):
+        for proxy, proxy_auth in (
+            ("socks4://proxy.example:1080", "user:password"),
+            ("socks4a://user@proxy.example:1080", None),
+        ):
+            with self.subTest(proxy=proxy, proxy_auth=proxy_auth):
+                self.options["proxy_auth"] = proxy_auth
+                self.options["proxies"] = [proxy]
+                with self.assertRaisesRegex(
+                    RequestException,
+                    "does not support SOCKS4 user IDs",
+                ):
+                    NativeHTTPBackend._proxy_urls(RequestConfig.from_options(self.options))
+
+    def test_reuses_engine_across_chunks_and_forwards_cancellation(self):
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            backend = NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            list(backend.scan("https://example.com/", ["first"]))
+            list(backend.scan("https://example.com/", ["second"]))
+            backend.cancel()
+
+        self.assertEqual(len(fake_native.engines), 1)
+        self.assertEqual(len(fake_native.engines[0].calls), 2)
+        self.assertEqual(len(fake_native.filter_configs), 1)
+        self.assertIs(
+            fake_native.engines[0].calls[0][1]["filter_config"],
+            fake_native.engines[0].calls[1][1]["filter_config"],
+        )
+        self.assertTrue(fake_native.engines[0].cancelled)
+
+    def test_cancellation_before_engine_creation_is_forwarded_to_first_scan(self):
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            backend = NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            backend.cancel()
+            list(backend.scan("https://example.com/", ["first"]))
+
+        self.assertEqual(len(fake_native.engines), 1)
+        self.assertTrue(fake_native.engines[0].cancelled)
+        self.assertEqual(len(fake_native.engines[0].calls), 1)
+
+    def test_reset_cancel_discards_cancellation_from_previous_lifecycle(self):
+        fake_native = FakeNativeModule()
+
+        with patch.dict("sys.modules", {"dirsearch_native": fake_native}):
+            backend = NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            backend.cancel()
+            backend.reset_cancel()
+            list(backend.scan("https://example.com/", ["first"]))
+
+        self.assertEqual(len(fake_native.engines), 1)
+        self.assertFalse(fake_native.engines[0].cancelled)
+        self.assertEqual(len(fake_native.engines[0].calls), 1)
+
+    def test_origin_407_remains_a_response_without_a_proxy(self):
+        fake_native = FakeNativeModule()
+        self.options["proxies"] = []
+
+        with (
+            patch.dict("sys.modules", {"dirsearch_native": fake_native}),
+            patch.object(FakeNativeResult, "status", 407),
+        ):
+            backend = NativeHTTPBackend(
+                RequestConfig.from_options(self.options),
+                filter_config=FilterConfig.from_options(self.options),
+            )
+            rows = list(backend.scan("https://example.com/", ["admin"]))
+
+        self.assertEqual(len(rows), 1)
+        _, response, error = rows[0]
+        self.assertIsNone(error)
+        self.assertEqual(response.status, 407)

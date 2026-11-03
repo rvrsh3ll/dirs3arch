@@ -1,0 +1,971 @@
+# -*- coding: utf-8 -*-
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 2 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program; if not, write to the Free Software
+#  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+#  MA 02110-1301, USA.
+#
+#  Author: Mauro Soria
+
+from copy import copy
+from optparse import OptionParser, OptionGroup, Values
+
+
+from lib.core.settings import (
+    AUTHENTICATION_TYPES,
+    FILE_BASED_OUTPUT_FORMATS,
+    VERSION,
+)
+from lib.utils.common import get_config_file
+
+
+COMMON_HELP_OPTIONS = frozenset(
+    {
+        "--version",
+        "--help",
+        "--help-all",
+        "--url",
+        "--urls-file",
+        "--stdin",
+        "--cidr",
+        "--raw",
+        "--session",
+        "--config",
+        "--wordlists",
+        "--wordlist-categories",
+        "--extensions",
+        "--force-extensions",
+        "--exclude-extensions",
+        "--prefixes",
+        "--suffixes",
+        "--threads",
+        "--async",
+        "--no-async",
+        "--recursive",
+        "--max-recursion-depth",
+        "--recursion-status",
+        "--include-status",
+        "--exclude-status",
+        "--exclude-sizes",
+        "--exclude-text",
+        "--exclude-regex",
+        "--exclude-redirect",
+        "--max-time",
+        "--target-max-time",
+        "--http-method",
+        "--data",
+        "--header",
+        "--follow-redirects",
+        "--random-agent",
+        "--user-agent",
+        "--cookie",
+        "--auth",
+        "--auth-type",
+        "--timeout",
+        "--delay",
+        "--proxy",
+        "--tor",
+        "--scheme",
+        "--max-rate",
+        "--retries",
+        "--crawl",
+        "--full-url",
+        "--no-color",
+        "--quiet-mode",
+        "--verbose",
+        "--output-formats",
+        "--output-file",
+        "--save-response",
+        "--save-response-jsonl",
+        "--log",
+    }
+)
+
+
+class DirsearchOptionParser(OptionParser):
+    def _process_short_opts(self, rargs, values) -> None:
+        # optparse treats -hh as two -h flags unless it is handled explicitly.
+        if rargs[0] == "-hh":
+            rargs[0] = "--help-all"
+            self._process_long_opt(rargs, values)
+            return
+
+        super()._process_short_opts(rargs, values)
+
+
+def _iter_options(parser: OptionParser):
+    yield from parser.option_list
+    for group in parser.option_groups:
+        yield from group.option_list
+
+
+def _is_common_help_option(option) -> bool:
+    return bool(
+        COMMON_HELP_OPTIONS.intersection(option._short_opts + option._long_opts)
+    )
+
+
+def _build_common_help_parser(parser: OptionParser) -> OptionParser:
+    available_options = {
+        option_string
+        for option in _iter_options(parser)
+        for option_string in option._short_opts + option._long_opts
+    }
+    missing_options = COMMON_HELP_OPTIONS - available_options
+    if missing_options:
+        raise RuntimeError(
+            f"Unknown common help options: {', '.join(sorted(missing_options))}"
+        )
+
+    common_parser = OptionParser(
+        usage=parser.usage,
+        description=parser.description,
+        epilog=(
+            "Use '-hh' or '--help-all' to show every option. "
+            f"{parser.epilog}"
+        ),
+        add_help_option=False,
+    )
+
+    for option in parser.option_list:
+        if _is_common_help_option(option):
+            common_parser.add_option(copy(option))
+
+    for group in parser.option_groups:
+        common_group = OptionGroup(common_parser, group.title, group.description)
+        for option in group.option_list:
+            if _is_common_help_option(option):
+                common_group.add_option(copy(option))
+        if common_group.option_list:
+            common_parser.add_option_group(common_group)
+
+    return common_parser
+
+
+def _show_common_help(option, option_string, value, parser: OptionParser) -> None:
+    _build_common_help_parser(parser).print_help()
+    parser.exit()
+
+
+def _show_all_help(option, option_string, value, parser: OptionParser) -> None:
+    parser.print_help()
+    parser.exit()
+
+
+def parse_arguments(arguments: list[str] | None = None) -> Values:
+    usage = "Usage: %prog [-u|--url] URL [-e|--extensions] EXTENSIONS [options]"
+    epilog = "See 'config.ini' for the example configuration file"
+    parser = DirsearchOptionParser(
+        usage=usage,
+        epilog=epilog,
+        version=f"dirsearch v{VERSION}",
+        add_help_option=False,
+    )
+    parser.add_option(
+        "-h",
+        "--help",
+        action="callback",
+        callback=_show_common_help,
+        help="Show common options and exit",
+    )
+    parser.add_option(
+        "--help-all",
+        action="callback",
+        callback=_show_all_help,
+        help="Show all options and exit (short form: -hh)",
+    )
+
+    # Mandatory arguments
+    mandatory = OptionGroup(parser, "Mandatory")
+    mandatory.add_option(
+        "-u",
+        "--url",
+        action="append",
+        dest="urls",
+        metavar="URL",
+        help="Target URL(s), can use multiple flags",
+    )
+    mandatory.add_option(
+        "-l",
+        "--urls-file",
+        action="store",
+        dest="urls_file",
+        metavar="PATH",
+        help="URL list file",
+    )
+    mandatory.add_option(
+        "--stdin", action="store_true", dest="stdin_urls", help="Read URL(s) from STDIN"
+    )
+    mandatory.add_option("--cidr", action="store", dest="cidr", help="Target CIDR")
+    mandatory.add_option(
+        "--raw",
+        action="store",
+        dest="raw_file",
+        metavar="PATH",
+        help="Load raw HTTP request from file (use '--scheme' flag to set the scheme)",
+    )
+    mandatory.add_option(
+        "--nmap-report",
+        action="store",
+        dest="nmap_report",
+        metavar="PATH",
+        help="Load targets from nmap report (Ensure the inclusion of the -sV flag during nmap scan for comprehensive results)",
+    )
+    mandatory.add_option(
+        "-s", "--session", action="store", dest="session_file", help="Session file"
+    )
+    mandatory.add_option(
+        "--session-id",
+        action="store",
+        dest="session_id",
+        metavar="ID",
+        help="Load session by numeric id (use --list-sessions to see ids)",
+    )
+    mandatory.add_option(
+        "--config",
+        action="store",
+        dest="config",
+        metavar="PATH",
+        help="Path to configuration file (Default: 'DIRSEARCH_CONFIG' environment variable, otherwise 'config.ini')",
+        default=get_config_file(),
+    )
+
+    # Dictionary Settings
+    dictionary = OptionGroup(parser, "Dictionary Settings")
+    dictionary.add_option(
+        "-w",
+        "--wordlists",
+        action="store",
+        dest="wordlists",
+        help="Wordlist files or directories contain wordlists (separated by commas)",
+    )
+    dictionary.add_option(
+        "--wordlist-categories",
+        action="store",
+        dest="wordlist_categories",
+        help=(
+            "Comma-separated wordlist category names (e.g. common,conf,web). "
+            "Use 'all' to include all bundled categories"
+        ),
+    )
+    dictionary.add_option(
+        "--wordlist-backend",
+        action="store",
+        dest="wordlist_backend",
+        metavar="BACKEND",
+        help="Wordlist generation backend: auto, python, native (default: auto)",
+    )
+    dictionary.add_option(
+        "--wordlist-status",
+        action="store_true",
+        dest="wordlist_status",
+        help="Show resolved wordlist files and generated entry count, then exit",
+    )
+    dictionary.add_option(
+        "--wordlist-max-size",
+        action="store",
+        type="int",
+        dest="wordlist_max_size",
+        metavar="COUNT",
+        help="Maximum generated wordlist entries before aborting (default: 500000)",
+    )
+    dictionary.add_option(
+        "-e",
+        "--extensions",
+        action="store",
+        dest="extensions",
+        help=(
+            "Extension list, separated by commas (e.g. php,asp); "
+            "use quoted '*' for common extensions"
+        ),
+    )
+    dictionary.add_option(
+        "-f",
+        "--force-extensions",
+        action="store_true",
+        dest="force_extensions",
+        help="Add extensions to the end of every wordlist entry. By default dirsearch only replaces the %EXT% keyword with extensions",
+    )
+    dictionary.add_option(
+        "--overwrite-extensions",
+        action="store_true",
+        dest="overwrite_extensions",
+        help="Overwrite other extensions in the wordlist with your extensions (selected via `-e`)",
+    )
+    dictionary.add_option(
+        "--exclude-extensions",
+        action="store",
+        dest="exclude_extensions",
+        metavar="EXTENSIONS",
+        help="Exclude extension list, separated by commas (e.g. asp,jsp)",
+    )
+    dictionary.add_option(
+        "--prefixes",
+        action="store",
+        dest="prefixes",
+        help="Add custom prefixes to all wordlist entries (separated by commas)",
+    )
+    dictionary.add_option(
+        "--suffixes",
+        action="store",
+        dest="suffixes",
+        help="Add custom suffixes to all wordlist entries, ignore directories (separated by commas)",
+    )
+    dictionary.add_option(
+        "-U",
+        "--uppercase",
+        action="store_true",
+        dest="uppercase",
+        help="Uppercase wordlist",
+    )
+    dictionary.add_option(
+        "-L",
+        "--lowercase",
+        action="store_true",
+        dest="lowercase",
+        help="Lowercase wordlist",
+    )
+    dictionary.add_option(
+        "-C",
+        "--capital",
+        action="store_true",
+        dest="capital",
+        help="Capital wordlist",
+    )
+
+    # Optional Settings
+    general = OptionGroup(parser, "General Settings")
+    general.add_option(
+        "-t",
+        "--threads",
+        action="store",
+        type="int",
+        dest="thread_count",
+        metavar="THREADS",
+        help="Number of threads",
+    )
+    general.add_option(
+        "--list-sessions",
+        action="store_true",
+        dest="list_sessions",
+        help="List resumable sessions and exit",
+    )
+    general.add_option(
+        "--sessions-dir",
+        action="store",
+        dest="sessions_dir",
+        metavar="PATH",
+        help=(
+            "Directory to search for resumable sessions (default: dirsearch path "
+            "/sessions, or $HOME/.dirsearch/sessions when bundled)"
+        ),
+    )
+    general.add_option(
+        "-a",
+        "--async",
+        action="store_true",
+        dest="async_mode",
+        help="Enable asynchronous mode",
+    )
+    general.add_option(
+        "--sync",
+        "--no-async",
+        action="store_false",
+        dest="async_mode",
+        help="Use synchronous Python mode",
+    )
+    general.add_option(
+        "-r",
+        "--recursive",
+        action="store_true",
+        dest="recursive",
+        help="Brute-force recursively",
+    )
+    general.add_option(
+        "--deep-recursive",
+        action="store_true",
+        dest="deep_recursive",
+        help="Perform recursive scan on every directory depth (e.g. api/users -> api/)",
+    )
+    general.add_option(
+        "--force-recursive",
+        action="store_true",
+        dest="force_recursive",
+        help="Do recursive brute-force for every found path, not only directories",
+    )
+    general.add_option(
+        "-R",
+        "--max-recursion-depth",
+        action="store",
+        type="int",
+        dest="recursion_depth",
+        metavar="DEPTH",
+        help="Maximum recursion depth (0 means unlimited)",
+    )
+    general.add_option(
+        "--recursion-status",
+        action="store",
+        dest="recursion_status_codes",
+        metavar="CODES",
+        help="Valid status codes to perform recursive scan, support ranges (separated by commas)",
+    )
+    general.add_option(
+        "--filter-threshold",
+        action="store",
+        type="int",
+        dest="filter_threshold",
+        metavar="THRESHOLD",
+        help="Maximum number of results with duplicate responses before getting filtered out",
+    )
+    general.add_option(
+        "--subdirs",
+        action="store",
+        dest="subdirs",
+        metavar="SUBDIRS",
+        help="Scan sub-directories of the given URL[s] (separated by commas)",
+    )
+    general.add_option(
+        "--exclude-subdirs",
+        action="store",
+        dest="exclude_subdirs",
+        metavar="SUBDIRS",
+        help="Exclude the following subdirectories during recursive scan (separated by commas)",
+    )
+    general.add_option(
+        "-i",
+        "--include-status",
+        action="store",
+        dest="include_status_codes",
+        metavar="CODES",
+        help="Include status codes, separated by commas, support ranges (e.g. 200,300-399)",
+    )
+    general.add_option(
+        "-x",
+        "--exclude-status",
+        action="store",
+        dest="exclude_status_codes",
+        metavar="CODES",
+        help="Exclude status codes, separated by commas, support ranges (e.g. 301,500-599)",
+    )
+    general.add_option(
+        "--exclude-sizes",
+        action="store",
+        dest="exclude_sizes",
+        metavar="SIZES",
+        help="Exclude responses by sizes, separated by commas (e.g. 0,0B,4KB)",
+    )
+    general.add_option(
+        "--exclude-text",
+        action="append",
+        dest="exclude_texts",
+        metavar="TEXTS",
+        help="Exclude responses by text, can use multiple flags",
+    )
+    general.add_option(
+        "--exclude-regex",
+        action="store",
+        dest="exclude_regex",
+        metavar="REGEX",
+        help="Exclude responses by regular expression",
+    )
+    general.add_option(
+        "--exclude-redirect",
+        action="store",
+        dest="exclude_redirect",
+        metavar="STRING",
+        help="Exclude responses if this regex (or text) matches redirect URL (e.g. '/index.html')",
+    )
+    general.add_option(
+        "--exclude-response",
+        action="store",
+        dest="exclude_response",
+        metavar="PATH",
+        help="Exclude responses similar to response of this page, path as input (e.g. 404.html)",
+    )
+    general.add_option(
+        "--skip-on-status",
+        action="store",
+        dest="skip_on_status",
+        metavar="CODES",
+        help="Skip target whenever hit one of these status codes, separated by commas, support ranges",
+    )
+    general.add_option(
+        "--min-response-size",
+        action="store",
+        dest="minimum_response_size",
+        help="Minimum response length (e.g. 1024,1KB)",
+        metavar="LENGTH",
+        default=0,
+    )
+    general.add_option(
+        "--max-response-size",
+        action="store",
+        dest="maximum_response_size",
+        help="Maximum response length (e.g. 1024,1KB)",
+        metavar="LENGTH",
+        default=0,
+    )
+    general.add_option(
+        "--max-time",
+        action="store",
+        type="int",
+        dest="max_time",
+        metavar="SECONDS",
+        help="Maximum runtime for the scan",
+    )
+    general.add_option(
+        "--target-max-time",
+        action="store",
+        type="int",
+        dest="target_max_time",
+        metavar="SECONDS",
+        help="Maximum runtime for a target",
+    )
+    general.add_option(
+        "--exit-on-error",
+        action="store_true",
+        dest="exit_on_error",
+        help="Exit whenever an error occurs",
+    )
+
+    # Advanced Filtering
+    advanced_filtering = OptionGroup(parser, "Advanced Filtering")
+    advanced_filtering.add_option(
+        "--auto-calibration",
+        action="store_true",
+        dest="auto_calibration",
+        help="Force extra wildcard calibration from the beginning",
+    )
+    advanced_filtering.add_option(
+        "--matcher-mode",
+        "--mmode",
+        action="store",
+        dest="matcher_mode",
+        metavar="MODE",
+        help="Advanced matcher operator: and, or",
+    )
+    advanced_filtering.add_option(
+        "--filter-mode",
+        "--fmode",
+        action="store",
+        dest="filter_mode",
+        metavar="MODE",
+        help="Advanced filter operator: and, or",
+    )
+    advanced_filtering.add_option(
+        "--match-status",
+        "--mc",
+        action="store",
+        dest="match_status_codes",
+        metavar="CODES",
+        help="Advanced matcher for status codes, separated by commas, support ranges",
+    )
+    advanced_filtering.add_option(
+        "--filter-status",
+        "--fc",
+        action="store",
+        dest="filter_status_codes",
+        metavar="CODES",
+        help="Advanced filter for status codes, separated by commas, support ranges",
+    )
+    advanced_filtering.add_option(
+        "--match-size",
+        "--ms",
+        action="store",
+        dest="match_sizes",
+        metavar="SIZES",
+        help="Advanced matcher for response length, separated by commas, support ranges",
+    )
+    advanced_filtering.add_option(
+        "--filter-size",
+        "--fs",
+        action="store",
+        dest="filter_sizes",
+        metavar="SIZES",
+        help="Advanced filter for response length, separated by commas, support ranges",
+    )
+    advanced_filtering.add_option(
+        "--match-words",
+        "--mw",
+        action="store",
+        dest="match_words",
+        metavar="WORDS",
+        help="Advanced matcher for response word count, separated by commas, support ranges",
+    )
+    advanced_filtering.add_option(
+        "--filter-words",
+        "--fw",
+        action="store",
+        dest="filter_words",
+        metavar="WORDS",
+        help="Advanced filter for response word count, separated by commas, support ranges",
+    )
+    advanced_filtering.add_option(
+        "--match-lines",
+        "--ml",
+        action="store",
+        dest="match_lines",
+        metavar="LINES",
+        help="Advanced matcher for response line count, separated by commas, support ranges",
+    )
+    advanced_filtering.add_option(
+        "--filter-lines",
+        "--fl",
+        action="store",
+        dest="filter_lines",
+        metavar="LINES",
+        help="Advanced filter for response line count, separated by commas, support ranges",
+    )
+    advanced_filtering.add_option(
+        "--match-regex",
+        "--mr",
+        action="store",
+        dest="match_regex",
+        metavar="REGEX",
+        help="Advanced matcher for response body regular expression",
+    )
+    advanced_filtering.add_option(
+        "--filter-regex",
+        "--fr",
+        action="store",
+        dest="filter_regex",
+        metavar="REGEX",
+        help="Advanced filter for response body regular expression",
+    )
+    advanced_filtering.add_option(
+        "--match-header",
+        action="append",
+        dest="match_headers",
+        metavar="TEXT",
+        help="Advanced matcher for response headers by text, can use multiple flags",
+    )
+    advanced_filtering.add_option(
+        "--filter-header",
+        action="append",
+        dest="filter_headers",
+        metavar="TEXT",
+        help="Advanced filter for response headers by text, can use multiple flags",
+    )
+    advanced_filtering.add_option(
+        "--match-header-regex",
+        action="store",
+        dest="match_header_regex",
+        metavar="REGEX",
+        help="Advanced matcher for response headers regular expression",
+    )
+    advanced_filtering.add_option(
+        "--filter-header-regex",
+        action="store",
+        dest="filter_header_regex",
+        metavar="REGEX",
+        help="Advanced filter for response headers regular expression",
+    )
+    advanced_filtering.add_option(
+        "--match-time",
+        "--mt",
+        action="store",
+        dest="match_time",
+        metavar="TIME",
+        help="Advanced matcher for elapsed milliseconds, e.g. >100 or <100",
+    )
+    advanced_filtering.add_option(
+        "--filter-time",
+        "--ft",
+        action="store",
+        dest="filter_time",
+        metavar="TIME",
+        help="Advanced filter for elapsed milliseconds, e.g. >100 or <100",
+    )
+
+    # Request Settings
+    request = OptionGroup(parser, "Request Settings")
+    request.add_option(
+        "-m",
+        "--http-method",
+        action="store",
+        dest="http_method",
+        metavar="METHOD",
+        help="HTTP method (default: GET)",
+    )
+    request.add_option(
+        "--request-backend",
+        action="store",
+        dest="request_backend",
+        metavar="BACKEND",
+        help="Request backend: python, native (default: python)",
+    )
+    request.add_option(
+        "-d", "--data", action="store", dest="data", help="HTTP request data"
+    )
+    request.add_option(
+        "--data-file",
+        action="store",
+        dest="data_file",
+        metavar="PATH",
+        help="Read request body from file without encoding or newline conversion"
+    )
+    request.add_option(
+        "-H",
+        "--header",
+        action="append",
+        dest="headers",
+        help="HTTP request header, can use multiple flags",
+    )
+    request.add_option(
+        "--headers-file",
+        dest="headers_file",
+        metavar="PATH",
+        help="File contains HTTP request headers",
+    )
+    request.add_option(
+        "-F",
+        "--follow-redirects",
+        action="store_true",
+        dest="follow_redirects",
+        help="Follow HTTP redirects",
+    )
+    request.add_option(
+        "--random-agent",
+        action="store_true",
+        dest="random_agents",
+        help="Choose a random User-Agent for each request",
+    )
+    request.add_option(
+        "--auth",
+        action="store",
+        dest="auth",
+        metavar="CREDENTIAL",
+        help="Authentication credential (e.g. user:password or bearer token)",
+    )
+    request.add_option(
+        "--auth-type",
+        action="store",
+        dest="auth_type",
+        metavar="TYPE",
+        help=f"Authentication type ({', '.join(AUTHENTICATION_TYPES)})",
+    )
+    request.add_option(
+        "--cert-file",
+        action="store",
+        dest="cert_file",
+        metavar="PATH",
+        help="File contains client-side certificate",
+    )
+    request.add_option(
+        "--key-file",
+        action="store",
+        dest="key_file",
+        metavar="PATH",
+        help="File contains client-side certificate private key (unencrypted)",
+    )
+    request.add_option("--user-agent", action="store", dest="user_agent")
+    request.add_option("--cookie", action="store", dest="cookie")
+
+    # Connection Settings
+    connection = OptionGroup(parser, "Connection Settings")
+    connection.add_option(
+        "--timeout",
+        action="store",
+        type="float",
+        dest="timeout",
+        help="Connection timeout in seconds (greater than 0)",
+    )
+    connection.add_option(
+        "--delay",
+        action="store",
+        type="float",
+        dest="delay",
+        help="Delay between requests in seconds (0 or greater)",
+    )
+    connection.add_option(
+        "-p",
+        "--proxy",
+        action="append",
+        dest="proxies",
+        metavar="PROXY",
+        help="Proxy URL (HTTP/SOCKS), can use multiple flags",
+    )
+    connection.add_option(
+        "--proxies-file",
+        action="store",
+        dest="proxies_file",
+        metavar="PATH",
+        help="File contains proxy servers",
+    )
+    connection.add_option(
+        "--proxy-auth",
+        action="store",
+        dest="proxy_auth",
+        metavar="CREDENTIAL",
+        help="Proxy authentication credential",
+    )
+    connection.add_option(
+        "--replay-proxy",
+        action="store",
+        dest="replay_proxy",
+        metavar="PROXY",
+        help="Proxy to replay with found paths",
+    )
+    connection.add_option(
+        "--tor", action="store_true", dest="tor", help="Use Tor network as proxy"
+    )
+    connection.add_option(
+        "--scheme",
+        action="store",
+        dest="scheme",
+        metavar="SCHEME",
+        help="Scheme for raw request or if there is no scheme in the URL (Default: auto-detect)",
+    )
+    connection.add_option(
+        "--max-rate",
+        action="store",
+        type="int",
+        dest="max_rate",
+        metavar="RATE",
+        help="Maximum requests per second (0 means unlimited)",
+    )
+    connection.add_option(
+        "--retries",
+        action="store",
+        type="int",
+        dest="max_retries",
+        metavar="RETRIES",
+        help="Number of retries for failed requests (0 or greater)",
+    )
+    connection.add_option("--ip", action="store", dest="ip", help="Server IP address")
+    connection.add_option("--interface", action="store", dest="network_interface", help="Network interface to use")
+
+    # Advanced Settings
+    advanced = OptionGroup(parser, "Advanced Settings")
+    advanced.add_option(
+        "--crawl",
+        action="store_true",
+        dest="crawl",
+        help="Crawl for new paths in responses"
+    )
+    advanced.add_option(
+        "--find-backup",
+        action="store_true",
+        dest="find_backup",
+        help="Look for backups of discovered files",
+    )
+
+    # View Settings
+    view = OptionGroup(parser, "View Settings")
+    view.add_option(
+        "--full-url",
+        action="store_true",
+        dest="full_url",
+        help="Full URLs in the output (enabled automatically in quiet mode)",
+    )
+    view.add_option(
+        "--redirects-history",
+        action="store_true",
+        dest="redirects_history",
+        help="Show redirects history",
+    )
+    view.add_option(
+        "--no-color", action="store_false", dest="color", help="No colored output"
+    )
+    view.add_option(
+        "-q", "--quiet-mode", action="store_true", dest="quiet", help="Quiet mode"
+    )
+    view.add_option(
+        "--disable-cli", action="store_true", dest="disable_cli", help="Turn off command-line output"
+    )
+    view.add_option(
+        "-v",
+        "--verbose",
+        action="store_true",
+        dest="verbose",
+        help="Show verbose output with response time and content type",
+    )
+
+    # Output Settings
+    output = OptionGroup(parser, "Output Settings")
+    output.add_option(
+        "-O",
+        "--output-formats",
+        action="store",
+        dest="output_formats",
+        metavar="FORMAT",
+        help=f"Report formats, separated by commas (Available: {', '.join(FILE_BASED_OUTPUT_FORMATS)})",
+    )
+    output.add_option(
+        "-o",
+        "--output-file",
+        action="store",
+        dest="output_file",
+        metavar="PATH",
+        help="Output file location",
+    )
+    output.add_option(
+        "--sqlite-commit-batch-size",
+        action="store",
+        type="int",
+        dest="sqlite_commit_batch_size",
+        metavar="COUNT",
+        help=(
+            "Commit SQLite reports every COUNT results (default: 1); "
+            "values above 1 may lose up to COUNT-1 recent rows after an "
+            "abrupt exit"
+        ),
+    )
+    output.add_option(
+        "--mysql-url",
+        action="store",
+        dest="mysql_url",
+        metavar="URL",
+        help="Database URL for MySQL output (Format: mysql://[username:password@]host[:port]/database-name)",
+    )
+    output.add_option(
+        "--postgres-url",
+        action="store",
+        dest="postgres_url",
+        metavar="URL",
+        help="Database URL for PostgreSQL output (Format: postgres://[username:password@]host[:port]/database-name)",
+    )
+    output.add_option(
+        "--save-response",
+        action="store",
+        dest="save_response",
+        metavar="PATH",
+        help="Save matched response bodies into a directory",
+    )
+    output.add_option(
+        "--save-response-jsonl",
+        action="store",
+        dest="save_response_jsonl",
+        metavar="PATH",
+        help="Append matched responses to a JSONL file",
+    )
+    output.add_option(
+        "--log", action="store", dest="log_file", metavar="PATH", help="Log file"
+    )
+
+    parser.add_option_group(mandatory)
+    parser.add_option_group(dictionary)
+    parser.add_option_group(general)
+    parser.add_option_group(advanced_filtering)
+    parser.add_option_group(request)
+    parser.add_option_group(connection)
+    parser.add_option_group(advanced)
+    parser.add_option_group(view)
+    parser.add_option_group(output)
+    options, positional_arguments = parser.parse_args(arguments)
+    if positional_arguments:
+        parser.error(
+            "unexpected positional argument(s); quote shell wildcards such as '*' "
+            "when passing option values"
+        )
+
+    return options

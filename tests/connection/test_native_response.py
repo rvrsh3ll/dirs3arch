@@ -1,0 +1,252 @@
+# -*- coding: utf-8 -*-
+
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+from unittest import TestCase
+
+from lib.connection.response import NativeResponse
+
+
+class TestNativeResponse(TestCase):
+    def test_native_response_import_does_not_require_python_http_clients(self):
+        repository_root = Path(__file__).resolve().parents[2]
+        script = textwrap.dedent(
+            """
+            import builtins
+
+            original_import = builtins.__import__
+
+            def reject_http_clients(name, *args, **kwargs):
+                if name.partition(".")[0] in {"httpx", "requests"}:
+                    raise ImportError(f"unexpected HTTP client import: {name}")
+                return original_import(name, *args, **kwargs)
+
+            builtins.__import__ = reject_http_clients
+
+            from lib.connection.response import NativeResponse
+
+            response = NativeResponse(
+                "https://example.com/admin",
+                200,
+                [("Content-Type", "text/plain")],
+                b"ok",
+            )
+            assert response.content == "ok"
+            """
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=repository_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_native_response_decodes_text_body(self):
+        response = NativeResponse(
+            "https://example.com/admin",
+            200,
+            [("Content-Type", "text/plain"), ("Content-Length", "2")],
+            b"ok",
+            0.125,
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.full_path, "admin")
+        self.assertEqual(response.length, 2)
+        self.assertEqual(response.content, "ok")
+        self.assertEqual(response.headers.get("content-type"), "text/plain")
+        self.assertEqual(response.elapsed, 0.125)
+
+    def test_native_response_uses_location_as_redirect(self):
+        response = NativeResponse(
+            "https://example.com/admin",
+            302,
+            [("Location", "/login")],
+            b"",
+        )
+
+        self.assertEqual(response.redirect, "/login")
+
+    def test_native_response_preserves_redirect_history(self):
+        response = NativeResponse(
+            "https://example.com/final",
+            200,
+            [],
+            b"ok",
+            history=(
+                "https://example.com/start",
+                "https://example.com/middle",
+            ),
+        )
+
+        self.assertEqual(
+            response.history,
+            [
+                "https://example.com/start",
+                "https://example.com/middle",
+            ],
+        )
+
+    def test_native_response_preserves_repeated_header_values(self):
+        response = NativeResponse(
+            "https://example.com/admin",
+            200,
+            [
+                ("X-Repeat", "one"),
+                ("x-repeat", "two"),
+                ("Set-Cookie", "first=1; Path=/"),
+                ("Set-Cookie", "second=2; Path=/"),
+            ],
+            b"ok",
+        )
+
+        self.assertEqual(response.headers.get("x-repeat"), "one, two")
+        self.assertEqual(
+            response.headers.get("set-cookie"),
+            "first=1; Path=/, second=2; Path=/",
+        )
+        self.assertEqual(response.headers.get_list("x-repeat"), ["one", "two"])
+        self.assertEqual(
+            response.headers.get_list("set-cookie"),
+            ["first=1; Path=/", "second=2; Path=/"],
+        )
+
+    def test_native_cjk_length_uses_network_bytes(self):
+        body = "测试".encode()
+        response = NativeResponse(
+            "https://example.com/admin/%E6%B5%8B%E8%AF%95",
+            200,
+            [("Content-Length", str(len(body)))],
+            body,
+        )
+
+        self.assertEqual(response.content, "测试")
+        self.assertEqual(len(response.content), 2)
+        self.assertEqual(response.length, 6)
+
+    def test_native_case_expansion_length_uses_network_bytes(self):
+        body = "/TEST-STRASSE".encode()
+        response = NativeResponse(
+            "https://example.com/test-stra%C3%9Fe",
+            200,
+            [("Content-Length", str(len(body)))],
+            body,
+        )
+
+        self.assertEqual(response.content, "/TEST-STRASSE")
+        self.assertEqual(response.length, len(body))
+
+    def test_native_invalid_utf8_uses_replacement_decoding(self):
+        response = NativeResponse(
+            "https://example.com/admin",
+            200,
+            [("Content-Type", "text/html; charset=utf-8")],
+            b"start\x96end",
+        )
+
+        self.assertEqual(response.body, b"start\x96end")
+        self.assertEqual(response.content, "start�end")
+        self.assertEqual(response.length, len(response.body))
+
+    def test_native_response_uses_declared_quoted_charset(self):
+        response = NativeResponse(
+            "https://example.com/price",
+            200,
+            [("Content-Type", 'text/plain; Charset="windows-1252"')],
+            b"price \xa3",
+        )
+
+        self.assertEqual(response.body, b"price \xa3")
+        self.assertEqual(response.content, "price £")
+
+    def test_native_response_uses_declared_utf16_for_binary_looking_text(self):
+        body = "hello world".encode("utf-16")
+        response = NativeResponse(
+            "https://example.com/utf16",
+            200,
+            [("Content-Type", "text/plain; charset=utf-16")],
+            body,
+        )
+
+        self.assertEqual(response.body, body)
+        self.assertEqual(response.content, "hello world")
+
+    def test_native_response_ignores_unknown_charset_for_binary_body(self):
+        body = bytes(range(256))
+        response = NativeResponse(
+            "https://example.com/binary",
+            200,
+            [("Content-Type", "text/plain; charset=x-dirsearch-unknown")],
+            body,
+        )
+
+        self.assertEqual(response.body, body)
+        self.assertEqual(response.content, "")
+
+    def test_native_response_does_not_decode_binary_media_with_charset(self):
+        body = bytes(range(256))
+        response = NativeResponse(
+            "https://example.com/image",
+            200,
+            [("Content-Type", "image/png; charset=utf-8")],
+            body,
+        )
+
+        self.assertEqual(response.body, body)
+        self.assertEqual(response.content, "")
+
+    def test_native_utf16_bom_artifact_body_does_not_raise_decode_error(self):
+        response = NativeResponse(
+            "https://example.com/%FF%FEadmin",
+            200,
+            [],
+            b"\xff\xfeadmin",
+        )
+
+        self.assertEqual(response.body, b"\xff\xfeadmin")
+        self.assertEqual(response.content, "��admin")
+        self.assertEqual(response.length, len(response.body))
+
+    def test_native_filtered_response_keeps_explicit_length_without_body(self):
+        response = NativeResponse(
+            "https://example.com/missing",
+            404,
+            [("content-type", "text/plain")],
+            [],
+            length=123,
+            filtered=True,
+            filter_reason="advanced_filter",
+        )
+
+        self.assertTrue(response.filtered)
+        self.assertEqual(response.filter_reason, "advanced_filter")
+        self.assertEqual(response.body, b"")
+        self.assertEqual(response.length, 123)
+
+    def test_truncated_native_responses_do_not_compare_as_complete_bodies(self):
+        prefix = b"\x00" + b"a" * 15
+        left = NativeResponse(
+            "https://example.com/left.bin",
+            200,
+            [("Content-Length", str(len(prefix) + 4))],
+            prefix,
+            length=len(prefix) + 4,
+        )
+        right = NativeResponse(
+            "https://example.com/right.bin",
+            200,
+            [("Content-Length", str(len(prefix) + 4))],
+            prefix,
+            length=len(prefix) + 4,
+        )
+
+        self.assertNotEqual(left, right)
+        self.assertFalse(left.body_complete)
+        self.assertTrue(left.body_truncated)

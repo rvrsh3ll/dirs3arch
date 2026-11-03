@@ -16,199 +16,1004 @@
 #
 #  Author: Mauro Soria
 
+from __future__ import annotations
+
 import http.client
 import random
+import re
 import socket
-import urllib.parse
+import ssl
+import sys
+import threading
+import time
+from typing import Any, Generator
+from urllib import request as urllib_request
+from urllib.parse import urlparse
 
-import thirdparty.requests as requests
-from .request_exception import *
-from .response import *
+import httpx
+import requests
+from httpx._utils import get_environment_proxies
+from httpx._transports.default import AsyncResponseStream, map_httpcore_exceptions
+from requests.auth import AuthBase, HTTPBasicAuth, HTTPDigestAuth
+from requests.packages import urllib3
+from urllib3 import connection as urllib3_connection
+from urllib3 import connectionpool as urllib3_connectionpool
+from urllib3 import poolmanager as urllib3_poolmanager
+from urllib3.contrib import socks as urllib3_socks
+from requests_ntlm import HttpNtlmAuth
+from httpx_ntlm import HttpNtlmAuth as HttpxNtlmAuth
+from requests_toolbelt.adapters.socket_options import SocketOptionsAdapter
+
+try:
+    from ssl import SSLCertVerificationError
+except ImportError:
+    SSLCertVerificationError = None
+
+from lib.connection.ip_overrides import IPOverrides
+from lib.connection.proxy import (
+    PROXY_AUTHENTICATION_REQUIRED,
+    add_proxy_authentication,
+    format_proxy_error,
+    proxy_error_status,
+)
+from lib.connection.rate_limiter import RequestRateLimiter
+from .request_target import (
+    PathPreservingPoolMixin,
+    RawRequestTarget,
+    RequestTargetURL,
+    join_request_target,
+)
+from lib.connection.response import AsyncResponse, Response
+from lib.core.request_config import RequestConfig
+from lib.core.exceptions import RequestException
+from lib.core.logger import RunLogger
+from lib.core.settings import (
+    MAX_REDIRECTS,
+    PROXY_SCHEMES,
+    RATE_UPDATE_DELAY,
+    READ_RESPONSE_ERROR_REGEX,
+    SCRIPT_PATH,
+)
+from lib.core.structures import CaseInsensitiveDict
+from lib.parse.url import append_query_string
+from lib.utils.common import safequote
+from lib.utils.file import FileUtils
+from lib.utils.mimetype import guess_mimetype
+
+# Disable InsecureRequestWarning from urllib3
+urllib3.disable_warnings(urllib3.exceptions.SecurityWarning)
 
 
-class Requester(object):
-    def __init__(
-        self,
-        url,
-        maxPool=1,
-        maxRetries=5,
-        timeout=20,
-        ip=None,
-        proxy=None,
-        proxylist=None,
-        redirect=False,
-        requestByHostname=False,
-        httpmethod="get",
-        data=None,
-        scheme=None,
-    ):
-        self.httpmethod = httpmethod
-        self.data = data
-        self.headers = {}
+class _IPOverrideConnection:
+    """Change the connection IP without changing the URL hostname or TLS SNI."""
 
-        # If no backslash, append one
-        if not url.endswith("/"):
-            url += "/"
+    def __init__(self, *args, ip_overrides: IPOverrides | None = None, **kwargs):
+        self._ip_overrides = ip_overrides
+        super().__init__(*args, **kwargs)
 
-        parsed = urllib.parse.urlparse(url)
+    def _new_conn(self):
+        if self._ip_overrides is None:
+            return super()._new_conn()
 
-        # If no protocol specified, set http by default
-        if "://" not in url:
-            parsed = urllib.parse.urlparse("{0}://{1}".format(scheme, url))
+        original_host = self._dns_host
+        forced_ip = self._ip_overrides.get_override(original_host, self.port)
+        if forced_ip is None:
+            # Let urllib3 resolve every A/AAAA candidate using the hostname.
+            return super()._new_conn()
 
-        # If protocol is not supported
-        elif parsed.scheme not in ["https", "http"]:
-            raise RequestException({"message": "Unsupported URL scheme: {0}".format(parsed.scheme)})
-
-        if parsed.path.startswith("/"):
-            self.basePath = parsed.path[1:]
-        else:
-            self.basePath = parsed.path
-
-        # Safe quote all special characters in basePath to prevent from being encoded when performing requests
-        self.basePath = urllib.parse.quote(self.basePath, safe="!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
-        self.protocol = parsed.scheme
-        self.host = parsed.netloc.split(":")[0]
-
-        # Resolve DNS to decrease overhead
-        if ip:
-            self.ip = ip
-        # A proxy could have a different DNS that would resolve the name. Therefore,
-        # resolving the name when using proxy to raise an error is pointless
-        elif not proxy and not proxylist:
-            try:
-                self.ip = socket.gethostbyname(self.host)
-            except socket.gaierror:
-                raise RequestException({"message": "Couldn't resolve DNS"})
-
-        # If no port specified, set default (80, 443)
+        self._dns_host = forced_ip
         try:
-            self.port = int(parsed.netloc.split(":")[1])
-        except IndexError:
-            self.port = 443 if self.protocol == "https" else 80
-        except ValueError:
-            raise RequestException(
-                {"message": "Invalid port number: {0}".format(parsed.netloc.split(":")[1])}
-            )
+            return super()._new_conn()
+        finally:
+            self._dns_host = original_host
 
-        # Set the Host header, this will be overwritten if the user has already set the header
-        self.headers["Host"] = self.host
 
-        # Include port in Host header if it's non-standard
-        if (self.protocol == "https" and self.port != 443) or (
-            self.protocol == "http" and self.port != 80
-        ):
-            self.headers["Host"] += ":{0}".format(self.port)
+class IPOverrideHTTPConnection(
+    _IPOverrideConnection,
+    urllib3_connection.HTTPConnection,
+):
+    pass
 
-        self.maxRetries = maxRetries
-        self.maxPool = maxPool
-        self.timeout = timeout
-        self.pool = None
-        self.proxy = proxy
-        self.proxylist = proxylist
-        self.redirect = redirect
-        self.randomAgents = None
-        self.requestByHostname = requestByHostname
-        self.session = requests.Session()
-        self.url = "{0}://{1}:{2}/".format(
-            self.protocol,
-            self.host if self.requestByHostname else self.ip,
-            self.port,
+
+class IPOverrideHTTPSConnection(
+    _IPOverrideConnection,
+    urllib3_connection.HTTPSConnection,
+):
+    pass
+
+
+class PathPreservingHTTPConnectionPool(
+    PathPreservingPoolMixin, urllib3_connectionpool.HTTPConnectionPool,
+):
+    ConnectionCls = IPOverrideHTTPConnection
+
+
+class PathPreservingHTTPSConnectionPool(
+    PathPreservingPoolMixin, urllib3_connectionpool.HTTPSConnectionPool,
+):
+    ConnectionCls = IPOverrideHTTPSConnection
+
+
+class PathPreservingSOCKSConnectionPool(
+    PathPreservingPoolMixin, urllib3_socks.SOCKSHTTPConnectionPool,
+):
+    pass
+
+
+class PathPreservingSOCKSHTTPSConnectionPool(
+    PathPreservingPoolMixin, urllib3_socks.SOCKSHTTPSConnectionPool,
+):
+    pass
+
+
+class PathPreservingPoolManager(urllib3_poolmanager.PoolManager):
+    def __init__(self, *args, ip_overrides: IPOverrides, **kwargs):
+        self._ip_overrides = ip_overrides
+        super().__init__(*args, **kwargs)
+        self.pool_classes_by_scheme = {
+            "http": PathPreservingHTTPConnectionPool,
+            "https": PathPreservingHTTPSConnectionPool,
+        }
+
+    def _new_pool(self, scheme, host, port, request_context=None):
+        pool = super()._new_pool(scheme, host, port, request_context)
+        pool.conn_kw["ip_overrides"] = self._ip_overrides
+        return pool
+
+
+class PathPreservingSocketOptionsAdapter(SocketOptionsAdapter):
+    def __init__(self, **kwargs):
+        self._ip_overrides = kwargs.pop("ip_overrides")
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False):
+        self.poolmanager = PathPreservingPoolManager(
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            socket_options=self.socket_options,
+            ip_overrides=self._ip_overrides,
         )
 
-    def setHeader(self, key, value):
-        self.headers[key.strip()] = value.strip() if value else value
+    def request_url(self, request: requests.PreparedRequest, proxies: dict[str, str]) -> str:
+        request_url = super().request_url(request, proxies)
+        if not isinstance(request.url, RequestTargetURL):
+            return request_url
 
-    def setRandomAgents(self, agents):
-        self.randomAgents = list(agents)
+        target = request.url.request_target
+        if request_url.startswith("/"):
+            return RawRequestTarget(target)
 
-    def unsetRandomAgents(self):
-        self.randomAgents = None
+        parsed_url = urlparse(request_url)
+        return RawRequestTarget(f"{parsed_url.scheme}://{parsed_url.netloc}{target}")
 
-    def request(self, path, proxy=None):
-        result = None
-        error = None
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        manager = super().proxy_manager_for(proxy, **proxy_kwargs)
+        if proxy.lower().startswith("socks"):
+            manager.pool_classes_by_scheme = {
+                "http": PathPreservingSOCKSConnectionPool,
+                "https": PathPreservingSOCKSHTTPSConnectionPool,
+            }
+        else:
+            manager.pool_classes_by_scheme = {
+                "http": PathPreservingHTTPConnectionPool,
+                "https": PathPreservingHTTPSConnectionPool,
+            }
+        return manager
 
-        for i in range(self.maxRetries):
+
+def _is_requests_ssl_error(exc: Exception) -> bool:
+    """Check if the exception is a requests-wrapped SSL error.
+
+    The requests library wraps ssl.SSLError inside requests.exceptions.SSLError,
+    so we need to inspect the exception chain to detect SSL errors that aren't
+    direct instances of ssl.SSLError.
+    """
+    if isinstance(exc, requests.exceptions.SSLError):
+        return True
+
+    # Check the exception cause chain (PEP 3134)
+    cause = exc.__cause__
+    while cause is not None:
+        if isinstance(cause, ssl.SSLError):
+            return True
+        cause = cause.__cause__
+
+    # Also check __context__ for implicit chaining
+    context = exc.__context__
+    while context is not None:
+        if isinstance(context, ssl.SSLError):
+            return True
+        context = context.__context__
+
+    return False
+
+
+def _iter_exception_chain(exc: BaseException) -> Generator[BaseException, None, None]:
+    seen = set()
+    pending = [exc]
+
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+
+        seen.add(id(current))
+        yield current
+
+        for attr in ("__cause__", "__context__"):
+            chained = getattr(current, attr, None)
+            if chained is not None:
+                pending.append(chained)
+
+
+def _is_dns_error(exc: Exception) -> bool:
+    """Return whether a request failure contains a DNS resolution error.
+
+    Requests stores urllib3 failures in exception arguments and ``reason``
+    attributes instead of always using Python exception chaining. HTTPX keeps
+    the originating ``socket.gaierror`` as a cause on supported versions.
+    Inspect both wrapper styles without treating arbitrary connection errors
+    as DNS failures.
+    """
+    seen = set()
+    pending = [exc]
+
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+
+        seen.add(id(current))
+        if isinstance(
+            current,
+            (socket.gaierror, urllib3.exceptions.NameResolutionError),
+        ):
+            return True
+
+        for attr in ("__cause__", "__context__", "reason", "_reason"):
+            nested = getattr(current, attr, None)
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+
+        pending.extend(
+            argument
+            for argument in current.args
+            if isinstance(argument, BaseException)
+        )
+
+    # Retain compatibility with HTTPX versions that exposed only the
+    # resolver's Linux errno text instead of the originating gaierror.
+    return isinstance(exc, httpx.ConnectError) and str(exc).startswith(
+        "[Errno -2]"
+    )
+
+
+def _find_ssl_error(exc: Exception) -> ssl.SSLError | None:
+    for current in _iter_exception_chain(exc):
+        if isinstance(current, ssl.SSLError):
+            return current
+
+    return None
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    for current in _iter_exception_chain(exc):
+        if isinstance(
+            current,
+            (
+                requests.exceptions.Timeout,
+                urllib3.exceptions.TimeoutError,
+                httpx.TimeoutException,
+                socket.timeout,
+            ),
+        ):
+            return True
+
+        message = str(current).lower()
+        if "timed out" in message or "timeout" in message:
+            return True
+
+    return False
+
+
+def _is_response_read_error(exc: Exception) -> bool:
+    for current in _iter_exception_chain(exc):
+        if isinstance(
+            current,
+            (
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ContentDecodingError,
+                requests.exceptions.StreamConsumedError,
+                requests.exceptions.UnrewindableBodyError,
+                httpx.DecodingError,
+                httpx.ReadError,
+                httpx.RemoteProtocolError,
+            ),
+        ):
+            return True
+
+        if re.search(READ_RESPONSE_ERROR_REGEX, type(current).__name__):
+            return True
+
+    return False
+
+
+def _is_ssl_error(exc: Exception) -> bool:
+    return isinstance(exc, requests.exceptions.SSLError) or _find_ssl_error(exc) is not None
+
+
+def _format_ssl_error(
+    exc: Exception, url: str = "", *, logger: RunLogger | None = None,
+) -> str:
+    """Format SSL error with specific, actionable error messages.
+
+    Provides detailed error messages based on the specific type of SSL error
+    instead of a generic 'Unexpected SSL error' message. This helps users
+    diagnose and fix SSL-related issues.
+    """
+    # Resolve the underlying ssl.SSLError from the exception chain
+    ssl_exc = _find_ssl_error(exc)
+
+    err_detail = str(ssl_exc or exc)
+
+    # Certificate verification errors
+    if SSLCertVerificationError is not None and isinstance(ssl_exc, SSLCertVerificationError):
+        if "self signed certificate" in err_detail.lower():
+            msg = f"SSL certificate verification failed (self-signed certificate): {url}"
+        elif "certificate has expired" in err_detail.lower():
+            msg = f"SSL certificate verification failed (certificate expired): {url}"
+        elif "certificate is not yet valid" in err_detail.lower():
+            msg = f"SSL certificate verification failed (certificate not yet valid): {url}"
+        elif "unable to get local issuer certificate" in err_detail.lower():
+            msg = f"SSL certificate verification failed (missing local issuer certificate): {url}"
+        elif "hostname" in err_detail.lower() and "match" in err_detail.lower():
+            msg = f"SSL certificate verification failed (hostname mismatch): {url}"
+        else:
+            msg = f"SSL certificate verification failed: {err_detail}"
+        if logger is not None:
+            logger.warning(f"SSL certificate error: {err_detail}")
+        return msg
+
+    # SSL handshake / protocol errors
+    if ssl_exc is not None:
+        err_lib = getattr(ssl_exc, "library", "")
+        err_reason = getattr(ssl_exc, "reason", "")
+
+        if "wrong version" in err_detail.lower() or "unsupported protocol" in err_detail.lower():
+            msg = f"SSL protocol version mismatch: {url}"
+        elif "handshake" in err_detail.lower():
+            msg = f"SSL handshake failed: {url}"
+        elif "no shared cipher" in err_detail.lower() or "no ciphers" in err_detail.lower():
+            msg = f"SSL handshake failed (no shared cipher suites): {url}"
+        elif err_lib == "SSL" and "EOF" in err_detail:
+            msg = f"SSL connection terminated unexpectedly: {url}"
+        elif "CERTIFICATE_VERIFY_FAILED" in err_detail:
+            msg = f"SSL certificate verification failed: {url}"
+        else:
+            msg = f"SSL error ({err_reason or err_lib or 'unknown'}): {err_detail}"
+
+        if logger is not None:
+            logger.warning(f"SSL error for {url}: library={err_lib}, reason={err_reason}, detail={err_detail}")
+        return msg
+
+    # Fallback for wrapped SSL errors where we can't get the underlying exception
+    if "CERTIFICATE_VERIFY_FAILED" in err_detail:
+        msg = f"SSL certificate verification failed: {url}"
+    elif "wrong version" in err_detail.lower():
+        msg = f"SSL protocol version mismatch: {url}"
+    else:
+        msg = f"SSL error: {err_detail}"
+
+    if logger is not None:
+        logger.warning(f"SSL error for {url}: {err_detail}")
+    return msg
+
+
+class BaseRequester:
+    def __init__(self, config: RequestConfig, *, logger: RunLogger | None = None) -> None:
+        self.logger = logger if logger is not None else RunLogger()
+        self.config = config
+        self._url: str = ""
+        self._query: str = ""
+        self._ip_overrides = IPOverrides()
+        self._rate_limiter = RequestRateLimiter()
+        # Display-only cache: (monotonic expiry, rate), owned by this requester.
+        self._rate_snapshot: tuple[float, int] | None = None
+        self._rate_snapshot_lock = threading.Lock()
+        self.proxy_cred = self.config.proxy_auth
+        self.headers = CaseInsensitiveDict(self.config.headers)
+        self.agents: list[str] = []
+        self.session = None
+        self._configured_auth = None
+
+        self._cert = None
+        if self.config.cert_file and self.config.key_file:
+            self._cert = (self.config.cert_file, self.config.key_file)
+
+        self._socket_options = []
+        if self.config.network_interface:
+            self._socket_options.append(
+                (
+                    socket.SOL_SOCKET,
+                    socket.SO_BINDTODEVICE,
+                    self.config.network_interface.encode("utf-8"),
+                )
+            )
+
+        if self.config.random_agents:
+            self._fetch_agents()
+
+        # Guess the mime type of request data if not specified
+        if self.config.body and "content-type" not in self.headers:
+            self.set_header("content-type", guess_mimetype(self.config.body))
+
+    def _fetch_agents(self) -> None:
+        self.agents = FileUtils.get_lines(
+            FileUtils.build_path(SCRIPT_PATH, "db", "user-agents.txt")
+        )
+
+    def set_url(self, url: str) -> None:
+        self._url = url
+
+    def set_query(self, query: str) -> None:
+        self._query = query
+
+    def set_ip(self, host: str, port: int, ip_address: str) -> None:
+        """Force the connection IP for a host while preserving its Host and SNI."""
+        self._ip_overrides.set_override(host, port, ip_address)
+
+    def request_path(self, path: str) -> str:
+        return append_query_string(path, self._query)
+
+    def set_header(self, key: str, value: str) -> None:
+        self.headers[key] = value.lstrip()
+
+    def _request_headers(self) -> CaseInsensitiveDict:
+        if not self.agents:
+            return self.headers
+
+        request_headers = CaseInsensitiveDict(self.headers)
+        request_headers["user-agent"] = random.choice(self.agents)
+        return request_headers
+
+    def reset_auth(self) -> None:
+        self.session.auth = self._configured_auth
+
+    def wait_for_rate_limit(self) -> None:
+        self._rate_limiter.wait(self.config.max_rate)
+
+    @property
+    def rate(self) -> int:
+        """Sample display telemetry at most once per interval, without pacing requests."""
+        # Read a coherent immutable pair; cached reads need no lock.
+        snapshot = self._rate_snapshot
+        if snapshot is not None and time.monotonic() < snapshot[0]:
+            return snapshot[1]
+
+        with self._rate_snapshot_lock:
+            # Another reader may have refreshed it while we waited.
+            snapshot = self._rate_snapshot
+            if snapshot is None or time.monotonic() >= snapshot[0]:
+                rate = self._rate_limiter.rate
+                snapshot = (time.monotonic() + RATE_UPDATE_DELAY, rate)
+                self._rate_snapshot = snapshot
+            return snapshot[1]
+
+
+class HTTPBearerAuth(AuthBase):
+    def __init__(self, token: str) -> None:
+        self.token = token
+
+    def __call__(self, request: requests.PreparedRequest) -> requests.PreparedRequest:
+        request.headers["Authorization"] = f"Bearer {self.token}"
+        return request
+
+
+class Requester(BaseRequester):
+    def __init__(self, config: RequestConfig, *, logger: RunLogger | None = None) -> None:
+        super().__init__(config, logger=logger)
+
+        self.session = requests.Session()
+        self.session.max_redirects = MAX_REDIRECTS
+        self.session.verify = False
+        self.session.cert = self._cert
+
+        for scheme in ("http://", "https://"):
+            self.session.mount(
+                scheme,
+                PathPreservingSocketOptionsAdapter(
+                    max_retries=0,
+                    pool_maxsize=self.config.concurrency,
+                    socket_options=self._socket_options,
+                    ip_overrides=self._ip_overrides,
+                ),
+            )
+
+        if self.config.auth:
+            self.set_auth(self.config.auth_type, self.config.auth)
+        self._configured_auth = self.session.auth
+
+    def set_auth(self, type: str, credential: str) -> None:
+        if type in ("bearer", "jwt"):
+            self.session.auth = HTTPBearerAuth(credential)
+        else:
             try:
-                if not proxy:
-                    if self.proxylist:
-                        proxy = random.choice(self.proxylist)
-                    elif self.proxy:
-                        proxy = self.proxy
+                user, password = credential.split(":", 1)
+            except ValueError:
+                user = credential
+                password = ""
 
-                if proxy:
-                    if not proxy.startswith(
-                        ("http://", "https://", "socks5://", "socks5h://", "socks4://", "socks4a://")
-                    ):
-                        proxy = "http://" + proxy
+            if type == "basic":
+                self.session.auth = HTTPBasicAuth(user, password)
+            elif type == "digest":
+                self.session.auth = HTTPDigestAuth(user, password)
+            else:
+                self.session.auth = HttpNtlmAuth(user, password)
 
-                    if proxy.startswith("http:"):
-                        proxies = {"http": proxy, "https": proxy}
-                    elif proxy.startswith("https:"):
-                        proxies = {"https": proxy}
-                    else:
-                        proxies = {"https": proxy, "http": proxy}
-                else:
-                    proxies = None
+    def close(self) -> None:
+        self.session.close()
 
-                url = self.url + self.basePath + path
+    # :path: is expected not to start with "/"
+    def request(self, path: str, proxy: str | None = None) -> Response:
+        self.wait_for_rate_limit()
 
-                if self.randomAgents:
-                    self.headers["User-Agent"] = random.choice(self.randomAgents)
+        err_msg = None
+        request_path = self.request_path(path)
+        quoted_request_path = safequote(request_path)
+        url = self._url + quoted_request_path
 
-                response = self.session.request(
-                    self.httpmethod,
+        # Why using a loop instead of max_retries argument? Check issue #1009
+        for _ in range(self.config.max_retries + 1):
+            try:
+                proxies = {}
+                try:
+                    proxy_url = proxy or random.choice(self.config.proxies)
+                    if not proxy_url.startswith(PROXY_SCHEMES):
+                        proxy_url = f"http://{proxy_url}"
+
+                    proxy_url = add_proxy_authentication(
+                        proxy_url,
+                        self.proxy_cred,
+                    )
+
+                    proxies["http"] = proxy_url
+                    proxies["https"] = proxy_url
+                except IndexError:
+                    pass
+
+                # Use prepared request to avoid the URL path from being normalized
+                # Reference: https://github.com/psf/requests/issues/5289
+                request = requests.Request(
+                    self.config.method,
                     url,
-                    data=self.data,
+                    headers=self._request_headers(),
+                    data=self.config.body,
+                )
+                prep = self.session.prepare_request(request)
+                prep.url = RequestTargetURL(
+                    url, join_request_target(self._url, quoted_request_path)
+                )
+
+                start_time = time.perf_counter()
+                origin_response = self.session.send(
+                    prep,
+                    allow_redirects=self.config.follow_redirects,
+                    timeout=self.config.timeout,
                     proxies=proxies,
-                    allow_redirects=self.redirect,
-                    headers=dict(self.headers),
-                    timeout=self.timeout,
-                    verify=False,
+                    stream=True,
                 )
+                try:
+                    if (
+                        proxies
+                        and origin_response.status_code
+                        == PROXY_AUTHENTICATION_REQUIRED
+                    ):
+                        raise RequestException("Proxy authentication required")
+                    response = Response(
+                        url,
+                        origin_response,
+                        capture_full_body=self.config.capture_full_body,
+                    )
+                finally:
+                    origin_response.close()
+                response.elapsed = time.perf_counter() - start_time
 
-                result = Response(
-                    response.status_code,
-                    response.reason,
-                    response.headers,
-                    response.content,
-                )
+                log_msg = f'"{self.config.method} {response.url}" {response.status} - {response.length}B'
 
-                break
+                if response.redirect:
+                    log_msg += f" - LOCATION: {response.redirect}"
 
-            except requests.exceptions.SSLError:
-                self.url = "{0}://{1}:{2}/".format(self.protocol, self.host, self.port)
+                self.logger.info(log_msg)
+
+                return response
+
+            except RequestException:
+                raise
+            except Exception as e:
+                self.logger.exception(e)
+
+                if _is_dns_error(e):
+                    err_msg = "Couldn't resolve DNS"
+                elif _is_timeout_error(e):
+                    err_msg = f"Request timeout: {url}"
+                elif _is_ssl_error(e):
+                    err_msg = _format_ssl_error(e, url, logger=self.logger)
+                elif isinstance(e, requests.exceptions.TooManyRedirects):
+                    err_msg = f"Too many redirects: {url}"
+                elif isinstance(e, requests.exceptions.ProxyError):
+                    err_msg = format_proxy_error(e)
+                    if proxy_error_status(e) in (407, 429):
+                        raise RequestException(err_msg) from e
+                elif isinstance(e, requests.exceptions.InvalidProxyURL):
+                    err_msg = f"Invalid proxy URL: {proxy}"
+                elif isinstance(e, requests.exceptions.InvalidURL):
+                    err_msg = f"Invalid URL: {url}"
+                elif _is_response_read_error(e):
+                    err_msg = f"Failed to read response body: {url}"
+                elif isinstance(e, requests.exceptions.ConnectionError):
+                    err_msg = f"Cannot connect to: {urlparse(url).netloc}"
+                elif isinstance(e, http.client.IncompleteRead):
+                    err_msg = f"Request timeout: {url}"
+                else:
+                    err_msg = f"There was a problem in the request to: {url}"
+
+        raise RequestException(err_msg)
+
+
+class HTTPXBearerAuth(httpx.Auth):
+    def __init__(self, token: str) -> None:
+        self.token = token
+
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, None, None]:
+        request.headers["Authorization"] = f"Bearer {self.token}"
+        yield request
+
+
+class IPOverrideAsyncTransport(httpx.AsyncBaseTransport):
+    def __init__(
+        self,
+        transport: httpx.AsyncBaseTransport,
+        ip_overrides: IPOverrides,
+    ) -> None:
+        self._transport = transport
+        self._ip_overrides = ip_overrides
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        port = request.url.port
+        forced_ip = self._ip_overrides.get_override(host, port)
+        if forced_ip is None:
+            # No override: let HTTPX resolve the hostname and choose an IP.
+            response = await self._transport.handle_async_request(request)
+        else:
+            extensions = dict(request.extensions)
+            if request.url.scheme == "https":
+                # Keep the original hostname for certificate validation and SNI.
+                extensions["sni_hostname"] = host
+
+            overridden_request = httpx.Request(
+                request.method,
+                request.url.copy_with(host=forced_ip),
+                headers=request.headers.raw,
+                stream=request.stream,
+                extensions=extensions,
+            )
+            response = await self._transport.handle_async_request(overridden_request)
+
+        if response.has_redirect_location:
+            # The raw target belongs only to the initial request. HTTPX copies
+            # request extensions when it builds a redirect, so leaving this in
+            # place would resend the original path for every redirect hop.
+            request.extensions.pop("target", None)
+        return response
+
+    async def aclose(self) -> None:
+        await self._transport.aclose()
+
+
+class PathPreservingAsyncHTTPTransport(httpx.AsyncHTTPTransport):
+    """Pass a raw target into httpcore without leaking it into proxy subrequests."""
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        target = request.extensions.get("target")
+        if target is None:
+            return await super().handle_async_request(request)
+
+        import httpcore
+
+        # httpcore constructs its own absolute-form or CONNECT request. Leaving
+        # the override in extensions would replace those generated targets too.
+        extensions = dict(request.extensions)
+        extensions.pop("target")
+        core_request = httpcore.Request(
+            method=request.method,
+            url=httpcore.URL(
+                scheme=request.url.raw_scheme,
+                host=request.url.raw_host,
+                port=request.url.port,
+                target=target,
+            ),
+            headers=request.headers.raw,
+            content=request.stream,
+            extensions=extensions,
+        )
+        with map_httpcore_exceptions():
+            core_response = await self._pool.handle_async_request(core_request)
+
+        response = httpx.Response(
+            status_code=core_response.status,
+            headers=core_response.headers,
+            stream=AsyncResponseStream(core_response.stream),
+            extensions=core_response.extensions,
+        )
+        if response.has_redirect_location:
+            # Keep the override for authentication challenges, but do not let
+            # HTTPX reuse it when constructing a request from Location.
+            request.extensions.pop("target", None)
+        return response
+
+
+class ProxyRoatingTransport(httpx.AsyncBaseTransport):
+    def __init__(self, proxies: list[str], **kwargs: Any) -> None:
+        self._transports = [
+            PathPreservingAsyncHTTPTransport(proxy=proxy, **kwargs)
+            for proxy in proxies
+        ]
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        transport = random.choice(self._transports)
+        return await transport.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        first_error = None
+        for transport in self._transports:
+            try:
+                await transport.aclose()
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+
+        if first_error is not None:
+            raise first_error
+
+
+class MacOSProxyAsyncClient(httpx.AsyncClient):
+    """Apply system exclusions before selecting an inherited proxy transport."""
+
+    def _transport_for_url(self, url: httpx.URL) -> httpx.AsyncBaseTransport:
+        # HTTPX reads macOS proxy URLs through urllib, but its mount map only
+        # includes NO_PROXY exclusions. Check system exceptions for every URL,
+        # including redirects, and reuse the default IP-override transport.
+        if urllib_request.proxy_bypass(url.host):
+            return self._transport
+        return super()._transport_for_url(url)
+
+
+class AsyncRequester(BaseRequester):
+    def __init__(self, config: RequestConfig, *, logger: RunLogger | None = None) -> None:
+        super().__init__(config, logger=logger)
+
+        tpargs = {
+            "verify": False,
+            "cert": self._cert,
+            "limits": httpx.Limits(max_connections=self.config.concurrency),
+            "socket_options": self._socket_options,
+        }
+        self._inherited_proxy_transports: set[httpx.AsyncBaseTransport] = set()
+        if self.config.proxies:
+            transport = ProxyRoatingTransport(
+                [self.parse_proxy(p) for p in self.config.proxies], **tpargs
+            )
+            mounts = None
+        else:
+            transport = IPOverrideAsyncTransport(
+                httpx.AsyncHTTPTransport(**tpargs),
+                self._ip_overrides,
+            )
+            mounts = self._environment_proxy_mounts(tpargs)
+
+        client_class = httpx.AsyncClient
+        if (
+            sys.platform == "darwin"
+            and self._inherited_proxy_transports
+            and not urllib_request.getproxies_environment()
+        ):
+            # urllib falls back to system settings only without environment
+            # proxy settings. Explicit and environment proxies keep priority.
+            client_class = MacOSProxyAsyncClient
+        self.session = client_class(
+            transport=transport,
+            mounts=mounts,
+            timeout=httpx.Timeout(self.config.timeout),
+            max_redirects=MAX_REDIRECTS,
+        )
+        self.replay_session = None
+
+        if self.config.auth:
+            self.set_auth(self.config.auth_type, self.config.auth)
+        self._configured_auth = self.session.auth
+
+    def _environment_proxy_mounts(
+        self, transport_options: dict[str, Any]
+    ) -> dict[str, httpx.AsyncBaseTransport | None]:
+        # Supplying a default transport makes HTTPX skip environment proxies.
+        # Rebuild its proxy map so NO_PROXY uses the IP-override transport and
+        # inherited proxies still preserve dirsearch's raw request targets.
+        mounts: dict[str, httpx.AsyncBaseTransport | None] = {}
+        for pattern, proxy in get_environment_proxies().items():
+            if proxy is None:
+                mounts[pattern] = None
                 continue
 
-            except requests.exceptions.TooManyRedirects:
-                error = "Too many redirects: {0}".format(url)
+            proxy_transport = PathPreservingAsyncHTTPTransport(
+                proxy=proxy, **transport_options
+            )
+            mounts[pattern] = proxy_transport
+            self._inherited_proxy_transports.add(proxy_transport)
+        return mounts
 
-            except requests.exceptions.ProxyError:
-                error = "Error with the proxy: {0}".format(proxy)
+    def _uses_inherited_proxy(
+        self, session: httpx.AsyncClient, response: httpx.Response
+    ) -> bool:
+        # Inspect the final request URL: redirects may change proxy routing.
+        if session is not self.session or not self._inherited_proxy_transports:
+            return False
+        return (
+            session._transport_for_url(response.request.url)
+            in self._inherited_proxy_transports
+        )
 
-            except requests.exceptions.ConnectionError:
-                error = "Cannot connect to: {0}:{1}".format(self.host, self.port)
+    def parse_proxy(self, proxy: str) -> str | httpx.Proxy | None:
+        if not proxy:
+            return None
 
-            except requests.exceptions.InvalidURL:
-                error = "Invalid URL: {0}".format(url)
+        if not proxy.startswith(PROXY_SCHEMES):
+            proxy = f"http://{proxy}"
 
-            except requests.exceptions.InvalidProxyURL:
-                error = "Invalid proxy URL: {0}".format(proxy)
+        proxy = add_proxy_authentication(proxy, self.proxy_cred)
 
-            except (
-                requests.exceptions.ConnectTimeout,
-                requests.exceptions.ReadTimeout,
-                requests.exceptions.Timeout,
-                http.client.IncompleteRead,
-                socket.timeout,
-            ):
-                error = "Request timeout: {0}".format(url)
+        if proxy.startswith("https://"):
+            proxy_ssl_context = ssl.create_default_context()
+            proxy_ssl_context.check_hostname = False
+            proxy_ssl_context.verify_mode = ssl.CERT_NONE
+            return httpx.Proxy(proxy, ssl_context=proxy_ssl_context)
 
-            except Exception:
-                error = "There was a problem in the request to: {0}".format(url)
+        return proxy
 
-        if error:
-            raise RequestException({"message": error})
+    def set_auth(self, type: str, credential: str) -> None:
+        if type in ("bearer", "jwt"):
+            self.session.auth = HTTPXBearerAuth(credential)
+        else:
+            try:
+                user, password = credential.split(":", 1)
+            except ValueError:
+                user = credential
+                password = ""
 
-        return result
+            if type == "basic":
+                self.session.auth = httpx.BasicAuth(user, password)
+            elif type == "digest":
+                self.session.auth = httpx.DigestAuth(user, password)
+            else:
+                self.session.auth = HttpxNtlmAuth(user, password)
+
+    async def close(self) -> None:
+        try:
+            if self.replay_session is not None:
+                await self.replay_session.aclose()
+        finally:
+            await self.session.aclose()
+
+    async def replay_request(self, path: str, proxy: str) -> AsyncResponse:
+        if self.replay_session is None:
+            transport = PathPreservingAsyncHTTPTransport(
+                verify=False,
+                cert=self._cert,
+                limits=httpx.Limits(max_connections=self.config.concurrency),
+                proxy=self.parse_proxy(proxy),
+                socket_options=self._socket_options,
+            )
+            self.replay_session = httpx.AsyncClient(
+                transport=transport,
+                timeout=httpx.Timeout(self.config.timeout),
+                max_redirects=MAX_REDIRECTS,
+            )
+        self.replay_session.auth = self.session.auth
+        self.replay_session.cookies.clear()
+        self.replay_session.cookies.update(self.session.cookies)
+        return await self.request(path, self.replay_session, replay=True)
+
+    # :path: is expected not to start with "/"
+    async def request(
+        self, path: str, session: httpx.AsyncClient | None = None, replay: bool = False
+    ) -> AsyncResponse:
+        await self.wait_for_rate_limit()
+
+        err_msg = None
+        request_path = self.request_path(path)
+        quoted_request_path = safequote(request_path)
+        url = self._url + quoted_request_path
+        session = session or self.session
+        using_proxy = replay or bool(self.config.proxies)
+
+        for _ in range(self.config.max_retries + 1):
+            try:
+                # Use "target" extension to avoid the URL path from being normalized
+                request = session.build_request(
+                    self.config.method,
+                    url,
+                    headers=self._request_headers(),
+                    content=self.config.body,
+                    extensions={
+                        "target": join_request_target(
+                            self._url, quoted_request_path
+                        ).encode()
+                    },
+                )
+
+                start_time = time.perf_counter()
+                xresponse = await session.send(
+                    request,
+                    stream=True,
+                    follow_redirects=self.config.follow_redirects,
+                )
+                try:
+                    if (
+                        xresponse.status_code == PROXY_AUTHENTICATION_REQUIRED
+                        and (
+                            using_proxy
+                            or self._uses_inherited_proxy(session, xresponse)
+                        )
+                    ):
+                        raise RequestException("Proxy authentication required")
+                    response = await AsyncResponse.create(
+                        url,
+                        xresponse,
+                        capture_full_body=self.config.capture_full_body,
+                    )
+                finally:
+                    await xresponse.aclose()
+                # Measure the whole streamed request lifecycle so sync and async
+                # modes report the same thing.
+                response.elapsed = time.perf_counter() - start_time
+
+                log_msg = f'"{self.config.method} {response.url}" {response.status} - {response.length}B'
+
+                if response.redirect:
+                    log_msg += f" - LOCATION: {response.redirect}"
+
+                self.logger.info(log_msg)
+
+                return response
+
+            except RequestException:
+                raise
+            except Exception as e:
+                self.logger.exception(e)
+
+                if _is_dns_error(e):
+                    err_msg = "Couldn't resolve DNS"
+                elif _is_timeout_error(e):
+                    err_msg = f"Request timeout: {url}"
+                elif isinstance(e, httpx.ConnectError) and not _is_ssl_error(e):
+                    err_msg = f"Cannot connect to: {urlparse(url).netloc}"
+                elif _is_ssl_error(e):
+                    err_msg = _format_ssl_error(e, url, logger=self.logger)
+                elif isinstance(e, httpx.TooManyRedirects):
+                    err_msg = f"Too many redirects: {url}"
+                elif isinstance(e, httpx.ProxyError):
+                    err_msg = format_proxy_error(e)
+                    if proxy_error_status(e) in (407, 429):
+                        raise RequestException(err_msg) from e
+                elif isinstance(e, httpx.InvalidURL):
+                    err_msg = f"Invalid URL: {url}"
+                elif _is_response_read_error(e):
+                    err_msg = f"Failed to read response body: {url}"
+                else:
+                    err_msg = f"There was a problem in the request to: {url}"
+
+        raise RequestException(err_msg)
+
+    async def wait_for_rate_limit(self) -> None:
+        await self._rate_limiter.wait_async(self.config.max_rate)

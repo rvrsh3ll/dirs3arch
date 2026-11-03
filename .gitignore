@@ -1,13 +1,17 @@
 /reports/
-logs/
-
-# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
+*.py.save
 *$py.class
-
-.idea
-
-db/test.txt
-
-default.conf
+.idea/
+.ropeproject/
+venv/
+.venv/
+.cache/
+build/
+dist/
+portable/
+pyinstaller/dist/
+/dirsearch.spec
+sessions/*
+!sessions/.gitkeep

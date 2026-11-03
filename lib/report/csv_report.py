@@ -1,0 +1,68 @@
+# -*- coding: utf-8 -*-
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 2 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program; if not, write to the Free Software
+#  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+#  MA 02110-1301, USA.
+#
+#  Author: Mauro Soria
+
+from io import StringIO
+
+from defusedcsv import csv
+
+from lib.core.decorators import locked
+from lib.core.settings import DEFAULT_ENCODING
+from lib.report.factory import BaseReport, FileReportMixin
+
+
+class CSVReport(FileReportMixin, BaseReport):
+    __format__ = "csv"
+    __extension__ = "csv"
+    _newline = ""
+
+    def new(self):
+        return [["URL", "Status", "Size", "Content Type", "Redirection", "Elapsed (s)"]]
+
+    def parse(self, file):
+        with open(file, encoding=DEFAULT_ENCODING, newline="") as fh:
+            rows = list(csv.reader(fh, delimiter=",", quotechar='"'))
+            # Not a dirsearch CSV report
+            if rows[0] != self.new()[0]:
+                raise ValueError(
+                    f"CSV header mismatch in {file}: expected {self.new()[0]}, "
+                    f"got {rows[0]}"
+                )
+
+            return rows
+
+    @locked
+    def save(self, file, result):
+        elapsed = round(result.elapsed, 3) if result.elapsed else ""
+        row = StringIO(newline="")
+        csv.writer(row, delimiter=",", quotechar='"').writerow(
+            [
+                result.url,
+                result.status,
+                result.length,
+                result.type,
+                result.redirect,
+                elapsed,
+            ]
+        )
+        self.append(file, row.getvalue())
+
+    def write(self, file, rows):
+        with self._atomic_writer(file) as fh:
+            writer = csv.writer(fh, delimiter=",", quotechar='"')
+            for row in rows:
+                writer.writerow(row)

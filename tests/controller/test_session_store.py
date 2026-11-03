@@ -1,0 +1,526 @@
+# -*- coding: utf-8 -*-
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 2 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program; if not, write to the Free Software
+#  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+#  MA 02110-1301, USA.
+#
+#  Author: Mauro Soria
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import tempfile
+from types import SimpleNamespace
+from unittest import TestCase, skipIf
+from unittest.mock import Mock, patch
+
+from lib.controller.session import SessionStore
+from lib.controller.session_options import SessionOptions
+from lib.core.run_config import RunConfig
+from lib.controller.run_resources import RunResources
+from lib.controller.controller import Controller
+from lib.core.target_progress import TargetProgress
+from lib.core.scan_run_state import ScanRunState
+from lib.core.dictionary import Dictionary
+from lib.core.report_config import ReportConfig
+from lib.core.run_metadata import RunMetadata
+from lib.core.wordlist_config import WordlistConfig
+from lib.core.exceptions import UnpicklingError
+
+
+class TestSessionStore(TestCase):
+    def _snapshot(self, options, last_output="", controller=None):
+        controller = self._controller() if controller is None else controller
+        controller.run_state.prepare_targets(options.get("urls", []))
+        return Controller._snapshot_session(controller, SessionOptions.from_options(options), last_output)
+
+    def _write_json(self, path: str, payload: dict) -> None:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+    def _write_session_dir(self, session_dir: str, url: str) -> None:
+        os.makedirs(session_dir, exist_ok=True)
+        self._write_json(
+            os.path.join(session_dir, SessionStore.FILES["meta"]),
+            {"version": SessionStore.SESSION_VERSION},
+        )
+        self._write_json(
+            os.path.join(session_dir, SessionStore.FILES["controller"]),
+            {"start_time": 0, "url": url, "directories": [], "jobs_processed": 1, "errors": 0},
+        )
+        self._write_json(
+            os.path.join(session_dir, SessionStore.FILES["dictionary"]),
+            {"items": ["legacy"], "index": 1, "extra": [], "extra_index": 0},
+        )
+        self._write_json(
+            os.path.join(session_dir, SessionStore.FILES["options"]),
+            {"urls": ["https://example.com"]},
+        )
+
+    def _write_session_file(self, session_file: str, url: str) -> None:
+        payload = {
+            "version": SessionStore.SESSION_VERSION,
+            "controller": {"start_time": 0, "url": url, "directories": [], "jobs_processed": 2, "errors": 0},
+            "dictionary": {"items": [], "index": 0, "extra": [], "extra_index": 0},
+            "options": {"urls": ["https://example.com"]},
+        }
+        self._write_json(session_file, payload)
+
+    def _controller(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            start_time=1767225600.0,
+            run_state=ScanRunState(),
+            target_progress=TargetProgress(url="https://example.com/"),
+            dictionary=Dictionary(WordlistConfig()),
+            output_history=[],
+        )
+
+    def test_list_sessions_recurses_and_includes_root_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nested_dir = os.path.join(tmpdir, "2024-01-01", "session_01")
+            self._write_session_dir(nested_dir, "https://nested.example.com")
+
+            root_file = os.path.join(tmpdir, "session_root.json")
+            self._write_session_file(root_file, "https://root.example.com")
+
+            current_dir = os.path.join(tmpdir, "2026-01-01", "session_02")
+            SessionStore().save(
+                self._snapshot({"urls": [], "output_formats": []}), current_dir
+            )
+
+            sessions = SessionStore().list_sessions(tmpdir)
+
+            self.assertEqual(len(sessions), 3)
+            self.assertEqual(
+                [session["path"] for session in sessions],
+                sorted([current_dir, nested_dir, root_file]),
+            )
+
+    def test_list_sessions_skips_non_session_json_without_hiding_valid_sessions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            valid_file = os.path.join(tmpdir, "valid.json")
+            self._write_session_file(valid_file, "https://valid.example.com")
+            self._write_json(os.path.join(tmpdir, "array.json"), [])
+            self._write_json(os.path.join(tmpdir, "scalar.json"), "unrelated")
+
+            sessions = SessionStore().list_sessions(tmpdir)
+
+        self.assertEqual(
+            [session["path"] for session in sessions],
+            [valid_file],
+        )
+
+    def test_list_sessions_skips_session_with_invalid_nested_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            valid_file = os.path.join(tmpdir, "valid.json")
+            self._write_session_file(valid_file, "https://valid.example.com")
+            invalid_file = os.path.join(tmpdir, "invalid.json")
+            self._write_json(
+                invalid_file,
+                {
+                    "version": SessionStore.SESSION_VERSION,
+                    "controller": [],
+                    "dictionary": {},
+                    "options": {},
+                },
+            )
+
+            store = SessionStore()
+            sessions = store.list_sessions(tmpdir)
+
+        self.assertEqual(
+            [session["path"] for session in sessions],
+            [valid_file],
+        )
+        self.assertEqual(len(store.invalid_sessions), 1)
+        self.assertEqual(store.invalid_sessions[0][0], invalid_file)
+        self.assertIn("controller", store.invalid_sessions[0][1])
+
+    def test_load_rejects_non_object_and_invalid_nested_state(self):
+        invalid_payloads = (
+            [],
+            {
+                "version": SessionStore.SESSION_VERSION,
+                "controller": {"start_time": 0},
+                "dictionary": [],
+                "options": {},
+            },
+            {
+                "version": SessionStore.SESSION_VERSION,
+                "controller": {"start_time": 0, "directories": 7},
+                "dictionary": {
+                    "items": [],
+                    "index": 0,
+                    "extra": [],
+                    "extra_index": 0,
+                },
+                "options": {},
+            },
+            {
+                "version": SessionStore.SESSION_VERSION,
+                "controller": {"start_time": 0},
+                "dictionary": {
+                    "items": [],
+                    "index": 1,
+                    "extra": [],
+                    "extra_index": 0,
+                },
+                "options": {},
+            },
+            {
+                "version": SessionStore.SESSION_VERSION,
+                "controller": {"start_time": 0},
+                "dictionary": {
+                    "items": [],
+                    "index": 0,
+                    "extra": [],
+                    "extra_index": 0,
+                },
+                "options": {"urls": "https://invalid.example"},
+            },
+        )
+
+        for index, payload in enumerate(invalid_payloads):
+            with (
+                self.subTest(payload=payload),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                session_file = os.path.join(tmpdir, f"invalid-{index}.json")
+                self._write_json(session_file, payload)
+
+                with self.assertRaises(UnpicklingError):
+                    SessionStore().load(session_file)
+
+    def test_request_body_bytes_round_trip_through_json_session(self):
+        body = "value=\u00e9&currency=\u20ac\r\n".encode("cp1252")
+        session_options = {"data": body, "output_formats": []}
+        controller = self._controller()
+
+        with tempfile.TemporaryDirectory() as session_dir:
+            store = SessionStore()
+            store.save(self._snapshot(session_options, controller=controller), session_dir)
+            payload = store.load(session_dir)
+            restored = payload.options.to_options()
+
+        self.assertEqual(restored["data"], body)
+
+    def test_load_and_listing_reject_incomplete_or_null_progress(self):
+        controller = {
+            "start_time": 123.5, "url": "https://example.test/",
+            "base_path": "", "directories": [], "passed_urls": [],
+            "jobs_processed": 0, "errors": 0, "consecutive_errors": 0,
+            "old_session": False,
+        }
+        invalid_states = [{key: value for key, value in controller.items() if key != "start_time"}]
+        invalid_states.extend({**controller, key: None} for key in controller)
+        for state in invalid_states:
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, "invalid.json")
+                self._write_json(path, {
+                    "version": 1, "controller": state,
+                    "dictionary": {"items": [], "index": 0}, "options": {},
+                })
+                store = SessionStore()
+                with self.assertRaises(UnpicklingError):
+                    store.load(path)
+                self.assertEqual(store.list_sessions(directory), [])
+                self.assertEqual(len(store.invalid_sessions), 1)
+
+    def test_loaded_checkpoint_file_can_be_overwritten_in_place(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_file = os.path.join(tmpdir, "checkpoint.json")
+            self._write_session_file(
+                session_file,
+                "https://previous.example/",
+            )
+            store = SessionStore()
+            session_options = {
+                "urls": ["https://current.example/"], "output_formats": [],
+            }
+            controller = self._controller()
+            controller.run_state.jobs_processed = 7
+
+            store.load(session_file)
+            store.save(self._snapshot(session_options, "current output", controller), session_file)
+            restored = store.load(session_file)
+
+            self.assertTrue(os.path.isfile(session_file))
+            self.assertEqual(
+                os.listdir(tmpdir),
+                ["checkpoint.json"],
+            )
+            self.assertEqual(restored.run.jobs_processed, 7)
+            self.assertEqual(
+                [task.target for task in restored.remaining_tasks],
+                ["https://current.example/"],
+            )
+            self.assertEqual(restored.last_output, "current output")
+
+    @skipIf(os.name == "nt", "POSIX mode bits are unavailable on Windows")
+    def test_overwriting_checkpoint_file_tightens_its_permissions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_file = os.path.join(tmpdir, "checkpoint.json")
+            self._write_session_file(
+                session_file,
+                "https://previous.example/",
+            )
+            os.chmod(session_file, 0o644)
+
+            SessionStore().save(self._snapshot({"output_formats": []}), session_file)
+
+            self.assertEqual(
+                stat.S_IMODE(os.stat(session_file).st_mode),
+                0o600,
+            )
+
+    def test_resume_preserves_later_jobs_and_targets_with_full_wordlist(self):
+        target_urls = ["https://first.example/", "https://second.example/"]
+        session_options = {
+            "urls": target_urls,
+            "output_formats": [],
+            "output_file": None,
+            "output_table": None,
+            "mysql_url": None,
+            "postgres_url": None,
+            "sqlite_commit_batch_size": 1,
+        }
+        controller = self._controller()
+        controller.target_progress.directories = ["current/", "next/"]
+        controller.run_state.jobs_processed = 3
+        controller.dictionary = Dictionary(WordlistConfig())
+        controller.dictionary.__setstate__(
+            (["done", "in-flight", "later"], 1, [], 0)
+        )
+        self.assertEqual(controller.dictionary.claim_next(), "in-flight")
+
+        with tempfile.TemporaryDirectory() as session_dir:
+            store = SessionStore()
+            store.save(self._snapshot(session_options, controller=controller), session_dir)
+            payload = store.load(session_dir)
+            restored_options = payload.options.to_options()
+            resumed = object.__new__(Controller)
+            resumed.resources = RunResources(interface=Mock(), logger=Mock())
+            resumed.config = RunConfig(reports=ReportConfig.from_options(restored_options))
+            resumed.metadata = RunMetadata("dirsearch", "2026-10-06 12:00:00")
+            resumed.run_state = ScanRunState()
+            resumed.target_progress = TargetProgress()
+            resumed._restore_session(payload)
+            self.addCleanup(resumed.resources.reporter.finish)
+
+        self.assertEqual(resumed.target_progress.directories, ["current/", "next/"])
+        self.assertEqual(resumed.run_state.jobs_processed, 3)
+        self.assertEqual([task.target for task in payload.remaining_tasks], target_urls)
+
+        self.assertEqual(
+            [next(resumed.dictionary), next(resumed.dictionary)],
+            ["in-flight", "later"],
+        )
+        with self.assertRaises(StopIteration):
+            next(resumed.dictionary)
+
+        for boundary in ("next job", "next target"):
+            with self.subTest(boundary=boundary):
+                resumed.dictionary.reset()
+                self.assertEqual(
+                    [
+                        next(resumed.dictionary),
+                        next(resumed.dictionary),
+                        next(resumed.dictionary),
+                    ],
+                    ["done", "in-flight", "later"],
+                )
+                with self.assertRaises(StopIteration):
+                    next(resumed.dictionary)
+
+    def test_failed_resave_preserves_complete_previous_checkpoint(self):
+        old_urls = ["https://old.example/"]
+        new_urls = ["https://new.example/"]
+        session_options = {"urls": old_urls, "output_formats": []}
+        controller = self._controller()
+        controller.run_state.jobs_processed = 1
+        controller.dictionary = Dictionary(WordlistConfig())
+        controller.dictionary.__setstate__((["one", "two"], 1, [], 0))
+
+        with tempfile.TemporaryDirectory() as session_dir:
+            store = SessionStore()
+            store.save(self._snapshot(session_options, "old output", controller), session_dir)
+
+            controller.run_state.jobs_processed = 2
+            controller.dictionary.__setstate__((["one", "two"], 2, [], 0))
+            session_options["urls"] = new_urls
+            original_dump = json.dump
+
+            def fail_during_checkpoint(payload, file_handle, *args, **kwargs):
+                original_dump(payload, file_handle, *args, **kwargs)
+                if "items" in payload or "dictionary" in payload:
+                    raise OSError("injected serialization failure")
+
+            with (
+                patch(
+                    "lib.controller.session.json.dump",
+                    side_effect=fail_during_checkpoint,
+                ),
+                self.assertRaisesRegex(OSError, "injected serialization failure"),
+            ):
+                store.save(self._snapshot(session_options, "new output", controller), session_dir)
+
+            restored = store.load(session_dir)
+
+        self.assertEqual(restored.run.jobs_processed, 1)
+        self.assertEqual(restored.task_checkpoint.dictionary.index, 1)
+        self.assertEqual([task.target for task in restored.remaining_tasks], old_urls)
+        self.assertEqual(restored.last_output, "old output")
+        self.assertEqual(
+            controller.output_history,
+            [],
+        )
+
+    @skipIf(os.name == "nt", "POSIX mode bits are unavailable on Windows")
+    def test_new_session_directory_and_files_are_private(self):
+        with tempfile.TemporaryDirectory() as root:
+            for umask in (0o000, 0o022):
+                with self.subTest(umask=oct(umask)):
+                    session_dir = os.path.join(root, f"session-{umask:o}")
+                    previous_umask = os.umask(umask)
+                    try:
+                        SessionStore().save(
+                            self._snapshot({"auth": "alice:secret"}), session_dir
+                        )
+                    finally:
+                        os.umask(previous_umask)
+
+                    self.assertEqual(
+                        stat.S_IMODE(os.stat(session_dir).st_mode),
+                        0o700,
+                    )
+                    self.assertEqual(
+                        os.listdir(session_dir),
+                        [SessionStore.CHECKPOINT_FILE],
+                    )
+                    checkpoint_path = os.path.join(
+                        session_dir, SessionStore.CHECKPOINT_FILE
+                    )
+                    self.assertEqual(
+                        stat.S_IMODE(os.stat(checkpoint_path).st_mode),
+                        0o600,
+                    )
+
+    @skipIf(os.name == "nt", "POSIX mode bits are unavailable on Windows")
+    def test_resaving_session_tightens_checkpoint_permissions(self):
+        with tempfile.TemporaryDirectory() as root:
+            session_dir = os.path.join(root, "session")
+            store = SessionStore()
+            snapshot = self._snapshot({"auth": "alice:secret"})
+            store.save(snapshot, session_dir)
+            os.chmod(session_dir, 0o755)
+            checkpoint_path = os.path.join(
+                session_dir, SessionStore.CHECKPOINT_FILE
+            )
+            os.chmod(checkpoint_path, 0o644)
+
+            store.save(snapshot, session_dir)
+
+            self.assertEqual(
+                stat.S_IMODE(os.stat(session_dir).st_mode),
+                0o755,
+            )
+            self.assertEqual(
+                stat.S_IMODE(os.stat(checkpoint_path).st_mode),
+                0o600,
+            )
+
+    def test_resave_migrates_legacy_directory_to_atomic_checkpoint(self):
+        with tempfile.TemporaryDirectory() as root:
+            session_dir = os.path.join(root, "session")
+            self._write_session_dir(session_dir, "https://legacy.example/")
+            controller = self._controller()
+            controller.run_state.jobs_processed = 7
+            store = SessionStore()
+
+            store.save(self._snapshot(
+                {"urls": ["https://current.example/"]}, "current output", controller
+            ), session_dir)
+            restored = store.load(session_dir)
+
+            self.assertTrue(
+                os.path.isfile(
+                    os.path.join(session_dir, SessionStore.CHECKPOINT_FILE)
+                )
+            )
+            for file_name in SessionStore.FILES.values():
+                self.assertFalse(
+                    os.path.exists(os.path.join(session_dir, file_name))
+                )
+            self.assertEqual(restored.run.jobs_processed, 7)
+            self.assertEqual(
+                [task.target for task in restored.remaining_tasks],
+                ["https://current.example/"],
+            )
+            self.assertEqual(restored.last_output, "current output")
+
+    def test_failed_legacy_migration_leaves_legacy_checkpoint_loadable(self):
+        with tempfile.TemporaryDirectory() as root:
+            session_dir = os.path.join(root, "session")
+            self._write_session_dir(session_dir, "https://legacy.example/")
+            store = SessionStore()
+            original_dump = json.dump
+
+            def fail_checkpoint(payload, file_handle, *args, **kwargs):
+                original_dump(payload, file_handle, *args, **kwargs)
+                raise OSError("injected migration failure")
+
+            with (
+                patch(
+                    "lib.controller.session.json.dump",
+                    side_effect=fail_checkpoint,
+                ),
+                self.assertRaisesRegex(OSError, "injected migration failure"),
+            ):
+                store.save(self._snapshot({"urls": ["https://new.example/"]}, "new output"), session_dir)
+
+            restored = store.load(session_dir)
+
+            self.assertFalse(
+                os.path.exists(
+                    os.path.join(session_dir, SessionStore.CHECKPOINT_FILE)
+                )
+            )
+            self.assertEqual(
+                restored.task_checkpoint.url,
+                "https://legacy.example/",
+            )
+            self.assertEqual(
+                [task.target for task in restored.remaining_tasks],
+                ["https://example.com"],
+            )
+
+    def test_bytes_marker_in_headers_remains_a_header_mapping(self):
+        marker = SessionStore.SESSION_BYTES_MARKER
+        headers = {marker: "header-value"}
+
+        restored = SessionStore().restore_options({"headers": headers})
+
+        self.assertEqual(restored["headers"], headers)
+
+    def test_invalid_request_body_encoding_is_rejected(self):
+        serialized = {
+            "data": {SessionStore.SESSION_BYTES_MARKER: "not base64!"}
+        }
+
+        with self.assertRaisesRegex(
+            UnpicklingError,
+            "Invalid binary session option: data",
+        ):
+            SessionStore().restore_options(serialized)

@@ -1,0 +1,2725 @@
+//! Cross-module regression tests for the native backend contract.
+
+use super::*;
+use crate::ntlm::{channel_binding_hash, split_username, tls_server_end_point};
+use crate::raw_client::{raw_http_request, RawHttpRequest};
+use crate::session::NativeCookieStore;
+use crate::transport::{
+    ntlm_authentication_scheme, ntlm_challenge, request_with_client, ClientRequest,
+};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
+use bytes::Bytes;
+use digest_auth::AuthContext;
+use hmac::{Hmac, Mac};
+use md4::{Digest as Md4Digest, Md4};
+use md5::Md5;
+use ntlmclient::{
+    Message as NtlmMessage, TargetInfoEntry as NtlmTargetInfoEntry,
+    TargetInfoType as NtlmTargetInfoType,
+};
+use rcgen::{
+    date_time_ymd, BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer,
+    KeyPair, KeyUsagePurpose,
+};
+use reqwest::cookie::CookieStore;
+use reqwest::header::{HeaderValue, WWW_AUTHENTICATE};
+use reqwest::Method;
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::server::WebPkiClientVerifier;
+use rustls::{RootCertStore, ServerConfig};
+use sha2::{Digest as Sha2Digest, Sha256};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{IpAddr, TcpListener, TcpStream};
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const INCOMPLETE_BODY_RESPONSE: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nno";
+const OK_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+const ZSTD_HELLO_WORLD: &[u8] = &[
+    0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x59, 0x00, 0x00, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x77,
+    0x6f, 0x72, 0x6c, 0x64, 0x68, 0x69, 0x1e, 0xb2,
+];
+const DIGEST_CHALLENGE_RESPONSE: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"dirsearch-test\", nonce=\"abcdef0123456789\", algorithm=SHA-256, qop=\"auth\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const DIGEST_COOKIE_CHALLENGE_RESPONSE: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"dirsearch-test\", nonce=\"abcdef0123456789\", algorithm=SHA-256, qop=\"auth\"\r\nSet-Cookie: challenge=session; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const MALFORMED_DIGEST_CHALLENGE_RESPONSE: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"missing-nonce\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const NTLM_CHALLENGE: &str = "TlRMTVNTUAACAAAAAAAAADgAAAAHgoiiF0KPZZZUrRcAAAAAAAAAACAAIAA4AAAACgBjRQAAAA8CAAAAAQAAAAQAAAADAAAABwAIAAA1pnm8UN0BAAAAAA==";
+type CapturedRequests = Arc<Mutex<Vec<Vec<u8>>>>;
+type RetryServer = (String, thread::JoinHandle<()>, CapturedRequests);
+
+#[allow(clippy::too_many_arguments)]
+fn build_http_client(
+    headers: &HeaderMap,
+    concurrency: usize,
+    timeout_secs: f64,
+    follow_redirects: bool,
+    max_redirects: usize,
+    proxy_url: Option<&str>,
+    client_identity: Option<(&[u8], &[u8])>,
+    cookie_store: Arc<NativeCookieStore>,
+) -> Result<reqwest::Client, String> {
+    build_http_client_with_routing(
+        headers,
+        concurrency,
+        timeout_secs,
+        follow_redirects,
+        max_redirects,
+        proxy_url,
+        client_identity,
+        cookie_store,
+        &ConnectionRoutes::default(),
+        "",
+        false,
+    )
+}
+
+fn default_filter_config() -> NativeFilterConfig {
+    NativeFilterConfig::from_options(
+        Vec::new(),
+        Vec::new(),
+        0,
+        0,
+        "or".to_string(),
+        "or".to_string(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap()
+}
+
+fn content_length(value: usize) -> Vec<(String, String)> {
+    vec![("Content-Length".to_string(), value.to_string())]
+}
+
+fn request_header(request: &[u8], expected_name: &str) -> Option<String> {
+    let headers = String::from_utf8_lossy(request);
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case(expected_name)
+            .then(|| value.trim().to_string())
+    })
+}
+
+#[test]
+fn connection_routes_normalize_hosts_and_bracketed_ipv6() {
+    let routes = ConnectionRoutes::from_config(&vec![
+        ("EXAMPLE.TEST.".to_string(), 443, "[::1]".to_string()),
+        ("other.test".to_string(), 80, "192.0.2.10".to_string()),
+        ("TÉST.invalid".to_string(), 8080, "192.0.2.20".to_string()),
+    ])
+    .unwrap();
+
+    assert_eq!(
+        routes.override_for("example.test", 443),
+        Some(IpAddr::V6("::1".parse().unwrap()))
+    );
+    assert_eq!(
+        routes.override_for("OTHER.TEST.", 80),
+        Some(IpAddr::V4("192.0.2.10".parse().unwrap()))
+    );
+    assert_eq!(
+        routes.override_for("xn--tst-bma.invalid", 8080),
+        Some(IpAddr::V4("192.0.2.20".parse().unwrap()))
+    );
+}
+
+#[test]
+fn connection_routes_reject_invalid_or_conflicting_ip_overrides() {
+    let invalid = ConnectionRoutes::from_config(&vec![(
+        "example.test".to_string(),
+        443,
+        "not-an-ip".to_string(),
+    )])
+    .unwrap_err();
+    assert!(invalid.contains("Invalid --ip value"), "{invalid}");
+
+    let conflict = ConnectionRoutes::from_config(&vec![
+        ("example.test".to_string(), 80, "192.0.2.10".to_string()),
+        ("example.test".to_string(), 443, "192.0.2.20".to_string()),
+    ])
+    .unwrap_err();
+    assert!(
+        conflict.contains("same address on every port"),
+        "{conflict}"
+    );
+
+    let literal_target = ConnectionRoutes::from_config(&vec![(
+        "127.0.0.2".to_string(),
+        80,
+        "127.0.0.1".to_string(),
+    )])
+    .unwrap_err();
+    assert!(
+        literal_target.contains("cannot reroute an IP-literal target"),
+        "{literal_target}"
+    );
+}
+
+#[test]
+fn reqwest_uses_connection_override_without_changing_host_header() {
+    let (base_url, server, requests) = spawn_retry_body_server(vec![OK_RESPONSE, OK_RESPONSE]);
+    let port = reqwest::Url::parse(&base_url).unwrap().port().unwrap();
+    let routes = ConnectionRoutes::from_config(&vec![
+        (
+            "forced-origin.invalid.".to_string(),
+            port,
+            "127.0.0.1".to_string(),
+        ),
+        ("TÉST.invalid".to_string(), port, "127.0.0.1".to_string()),
+    ])
+    .unwrap();
+    let client = build_http_client_with_routing(
+        &HeaderMap::new(),
+        1,
+        2.0,
+        false,
+        30,
+        None,
+        None,
+        Arc::new(NativeCookieStore::default()),
+        &routes,
+        "",
+        false,
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    for host in ["forced-origin.invalid.", "TÉST.invalid"] {
+        let response = runtime
+            .block_on(async {
+                client
+                    .get(format!("http://{host}:{port}/route"))
+                    .send()
+                    .await
+            })
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
+    server.join().unwrap();
+    let requests = Arc::try_unwrap(requests).unwrap().into_inner().unwrap();
+    assert_eq!(
+        request_header(&requests[0], "host"),
+        Some(format!("forced-origin.invalid.:{port}"))
+    );
+    assert_eq!(
+        request_header(&requests[1], "host"),
+        Some(format!("xn--tst-bma.invalid:{port}"))
+    );
+}
+
+#[test]
+fn raw_http_uses_connection_override_without_changing_host_header() {
+    let (base_url, server, requests) = spawn_retry_body_server(vec![OK_RESPONSE]);
+    let port = reqwest::Url::parse(&base_url).unwrap().port().unwrap();
+    let routes = ConnectionRoutes::from_config(&vec![(
+        "TÉST.invalid.".to_string(),
+        port,
+        "127.0.0.1".to_string(),
+    )])
+    .unwrap();
+    let base_url = format!("http://TÉST.invalid.:{port}/");
+    let headers = Vec::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let result = runtime.block_on(raw_http_request(
+        RawHttpRequest {
+            base_url: &base_url,
+            path: "raw%1path",
+            method: "GET",
+            body: &[],
+            headers: &headers,
+            random_user_agents: None,
+            timeout_secs: 2.0,
+            max_body_size: 80,
+            start: Instant::now(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            cookie_store: Arc::new(NativeCookieStore::default()),
+            connection_routes: &routes,
+            network_interface: "",
+        },
+        0,
+        &default_filter_config(),
+    ));
+    assert_eq!(result.status, 200);
+    server.join().unwrap();
+    let requests = Arc::try_unwrap(requests).unwrap().into_inner().unwrap();
+    assert_eq!(
+        request_header(&requests[0], "host"),
+        Some(format!("xn--tst-bma.invalid.:{port}"))
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn reqwest_and_raw_http_can_bind_the_loopback_interface() {
+    let (base_url, reqwest_server, _) = spawn_retry_body_server(vec![OK_RESPONSE]);
+    let client = build_http_client_with_routing(
+        &HeaderMap::new(),
+        1,
+        2.0,
+        false,
+        30,
+        None,
+        None,
+        Arc::new(NativeCookieStore::default()),
+        &ConnectionRoutes::default(),
+        "lo",
+        false,
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let response = runtime
+        .block_on(async { client.get(&base_url).send().await })
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    reqwest_server.join().unwrap();
+
+    let (base_url, raw_server, _) = spawn_retry_body_server(vec![OK_RESPONSE]);
+    let headers = Vec::new();
+    let routes = ConnectionRoutes::default();
+    let result = runtime.block_on(raw_http_request(
+        RawHttpRequest {
+            base_url: &base_url,
+            path: "raw%1path",
+            method: "GET",
+            body: &[],
+            headers: &headers,
+            random_user_agents: None,
+            timeout_secs: 2.0,
+            max_body_size: 80,
+            start: Instant::now(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            cookie_store: Arc::new(NativeCookieStore::default()),
+            connection_routes: &routes,
+            network_interface: "lo",
+        },
+        0,
+        &default_filter_config(),
+    ));
+    assert_eq!(result.status, 200, "{:?}", result.error);
+    raw_server.join().unwrap();
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut request = Vec::new();
+    let mut buffer = [0u8; 1024];
+    let header_end = loop {
+        let read = stream.read(&mut buffer).unwrap();
+        assert!(read > 0, "connection closed before request headers");
+        request.extend_from_slice(&buffer[..read]);
+        if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&request[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .unwrap_or_default();
+    let request_length = header_end + content_length;
+    while request.len() < request_length {
+        let read = stream.read(&mut buffer).unwrap();
+        assert!(read > 0, "connection closed before request body");
+        request.extend_from_slice(&buffer[..read]);
+    }
+    request.truncate(request_length);
+    request
+}
+
+fn spawn_retry_body_server(responses: Vec<&'static [u8]>) -> RetryServer {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_requests = requests.clone();
+    let server = thread::spawn(move || {
+        for response in responses {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("test server did not receive request: {error}"),
+                }
+            };
+            let request = read_http_request(&mut stream);
+            server_requests.lock().unwrap().push(request);
+            stream.write_all(response).unwrap();
+        }
+    });
+
+    (format!("http://{address}"), server, requests)
+}
+
+type NtlmServer = (
+    String,
+    thread::JoinHandle<()>,
+    CapturedRequests,
+    Arc<AtomicBool>,
+);
+
+fn spawn_ntlm_server(username: &str, password: &str) -> NtlmServer {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_requests = requests.clone();
+    let authenticated = Arc::new(AtomicBool::new(false));
+    let server_authenticated = authenticated.clone();
+    let username = username.to_string();
+    let password = password.to_string();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let first = read_http_request(&mut stream);
+        assert_eq!(request_header(&first, "authorization"), None);
+        server_requests.lock().unwrap().push(first);
+        stream
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .unwrap();
+
+        let second = read_http_request(&mut stream);
+        let negotiate = ntlm_authorization_token(&second, 1);
+        server_requests.lock().unwrap().push(second);
+        write!(
+            stream,
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM {NTLM_CHALLENGE}\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+        )
+        .unwrap();
+        stream.flush().unwrap();
+
+        let third = read_http_request(&mut stream);
+        let authenticate = ntlm_authorization_token(&third, 3);
+        server_requests.lock().unwrap().push(third);
+        if verify_ntlm_authenticate(&negotiate, &authenticate, &username, &password, None) {
+            server_authenticated.store(true, Ordering::Release);
+            stream.write_all(OK_RESPONSE).unwrap();
+        } else {
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        }
+    });
+
+    (format!("http://{address}"), server, requests, authenticated)
+}
+
+fn ntlm_authorization_token(request: &[u8], expected_message_type: u32) -> Vec<u8> {
+    let authorization = request_header(request, "authorization").expect("missing NTLM token");
+    let encoded = authorization
+        .strip_prefix("NTLM ")
+        .expect("authorization did not use NTLM");
+    let token = BASE64_STANDARD.decode(encoded).unwrap();
+    assert_eq!(&token[..8], b"NTLMSSP\0");
+    assert_eq!(
+        u32::from_le_bytes(token[8..12].try_into().unwrap()),
+        expected_message_type
+    );
+    token
+}
+
+fn verify_ntlm_authenticate(
+    negotiate: &[u8],
+    authenticate: &[u8],
+    username: &str,
+    password: &str,
+    expected_channel_bindings: Option<&[u8]>,
+) -> bool {
+    let challenge = match BASE64_STANDARD
+        .decode(NTLM_CHALLENGE)
+        .ok()
+        .and_then(|token| NtlmMessage::try_from(token.as_slice()).ok())
+    {
+        Some(NtlmMessage::Challenge(challenge)) => challenge,
+        _ => return false,
+    };
+    let message = match NtlmMessage::try_from(authenticate) {
+        Ok(NtlmMessage::Authenticate(message)) => message,
+        _ => return false,
+    };
+    let (expected_domain, expected_account) = username.split_once('\\').unwrap_or(("", username));
+    if message.domain_name != expected_domain || message.user_name != expected_account {
+        return false;
+    }
+    let Some((proof, blob)) = message.ntlm_response.split_at_checked(16) else {
+        return false;
+    };
+    if blob.len() < 32 || !blob.starts_with(&[1, 1, 0, 0, 0, 0, 0, 0]) {
+        return false;
+    }
+
+    let password_bytes = password
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let nt_hash = <Md4 as Md4Digest>::digest(password_bytes);
+    let identity = format!("{}{}", expected_account.to_uppercase(), expected_domain)
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    type HmacMd5 = Hmac<Md5>;
+    let mut response_key = <HmacMd5 as Mac>::new_from_slice(&nt_hash).unwrap();
+    response_key.update(&identity);
+    let response_key = response_key.finalize().into_bytes();
+    let mut proof_mac = <HmacMd5 as Mac>::new_from_slice(&response_key).unwrap();
+    proof_mac.update(&challenge.challenge);
+    proof_mac.update(blob);
+    if proof_mac.verify_slice(proof).is_err() {
+        return false;
+    }
+
+    let mut target_info = &blob[28..];
+    let mut received_channel_bindings = None;
+    let mut received_target_name = false;
+    while !target_info.is_empty() {
+        let Ok((entry, remaining)) = NtlmTargetInfoEntry::try_from_bytes(target_info) else {
+            return false;
+        };
+        match entry.entry_type {
+            NtlmTargetInfoType::Terminator => break,
+            NtlmTargetInfoType::ChannelBindings => received_channel_bindings = Some(entry.data),
+            NtlmTargetInfoType::TargetName => received_target_name = true,
+            _ => {}
+        }
+        target_info = remaining;
+    }
+    if !received_target_name {
+        return false;
+    }
+    match expected_channel_bindings {
+        Some(bindings) => {
+            if received_channel_bindings.as_deref()
+                != Some(channel_binding_hash(bindings).as_slice())
+            {
+                return false;
+            }
+        }
+        None if received_channel_bindings.is_some() => return false,
+        None => {}
+    }
+
+    let mic_offset = if message.flags.contains(ntlmclient::Flags::NEGOTIATE_VERSION) {
+        72
+    } else {
+        64
+    };
+    let Some(received_mic) = authenticate.get(mic_offset..mic_offset + 16) else {
+        return false;
+    };
+    let mut authenticate_without_mic = authenticate.to_vec();
+    authenticate_without_mic[mic_offset..mic_offset + 16].fill(0);
+    let mut session_key = <HmacMd5 as Mac>::new_from_slice(&response_key).unwrap();
+    session_key.update(proof);
+    let session_key = session_key.finalize().into_bytes();
+    let mut mic = <HmacMd5 as Mac>::new_from_slice(&session_key).unwrap();
+    mic.update(negotiate);
+    mic.update(&BASE64_STANDARD.decode(NTLM_CHALLENGE).unwrap());
+    mic.update(&authenticate_without_mic);
+    mic.verify_slice(received_mic).is_ok()
+}
+
+fn run_ntlm_request(
+    server_username: &str,
+    server_password: &str,
+    client_credential: &str,
+) -> (NativeHttpResult, Vec<Vec<u8>>, bool) {
+    run_ntlm_request_with_proxy(server_username, server_password, client_credential, false)
+}
+
+fn run_ntlm_request_with_proxy(
+    server_username: &str,
+    server_password: &str,
+    client_credential: &str,
+    use_proxy: bool,
+) -> (NativeHttpResult, Vec<Vec<u8>>, bool) {
+    let (base_url, server, requests, authenticated) =
+        spawn_ntlm_server(server_username, server_password);
+    let proxy_url =
+        use_proxy.then(|| base_url.replacen("http://", "http://proxy-user:proxy-password@", 1));
+    let client = build_http_client_with_routing(
+        &HeaderMap::new(),
+        1,
+        2.0,
+        false,
+        30,
+        proxy_url.as_deref(),
+        None,
+        Arc::new(NativeCookieStore::default()),
+        &ConnectionRoutes::default(),
+        "",
+        true,
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let url = if use_proxy {
+        "http://example.test/protected".to_string()
+    } else {
+        format!("{base_url}/protected")
+    };
+    let method = Method::GET;
+    let body = Bytes::new();
+    let filter_config = default_filter_config();
+    let auth = OriginAuth::from_config("ntlm", client_credential).unwrap();
+    let result = runtime.block_on(request_with_client(ClientRequest {
+        client: &client,
+        url: &url,
+        method: &method,
+        body: &body,
+        initial_cookie_override: None,
+        capture_redirect_history: false,
+        max_retries: 0,
+        max_body_size: 80,
+        start: Instant::now(),
+        filter_config: &filter_config,
+        skip_status_filtered_body: false,
+        origin_auth: &auth,
+        random_user_agents: None,
+    }));
+    server.join().unwrap();
+    let requests = Arc::try_unwrap(requests).unwrap().into_inner().unwrap();
+    (result, requests, authenticated.load(Ordering::Acquire))
+}
+
+struct NtlmTlsFixture {
+    server_config: Arc<ServerConfig>,
+    certificate_der: Vec<u8>,
+}
+
+fn ntlm_tls_fixture() -> NtlmTlsFixture {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let server_key = KeyPair::generate().unwrap();
+    let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let server_certificate = server_params.self_signed(&server_key).unwrap();
+    let certificate_der = server_certificate.der().to_vec();
+    let server_key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der()));
+    let server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![server_certificate.der().clone()], server_key_der)
+        .unwrap();
+
+    NtlmTlsFixture {
+        server_config: Arc::new(server_config),
+        certificate_der,
+    }
+}
+
+async fn read_async_http_request<S>(stream: &mut S) -> Result<Vec<u8>, String>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut request = Vec::new();
+    let mut buffer = [0u8; 1024];
+    loop {
+        let read = stream
+            .read(&mut buffer)
+            .await
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Err("connection closed before request headers".to_string());
+        }
+        request.extend_from_slice(&buffer[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            return Ok(request);
+        }
+    }
+}
+
+async fn run_https_ntlm_request() -> (NativeHttpResult, Result<Vec<Vec<u8>>, String>) {
+    use tokio::io::AsyncWriteExt;
+    use tokio_rustls::TlsAcceptor;
+
+    let fixture = ntlm_tls_fixture();
+    let expected_channel_bindings = tls_server_end_point(&fixture.certificate_der).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let acceptor = TlsAcceptor::from(fixture.server_config);
+    let server = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(3), async move {
+            let (stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
+            let mut stream = acceptor
+                .accept(stream)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut requests = Vec::new();
+
+            let first = read_async_http_request(&mut stream).await?;
+            if request_header(&first, "authorization").is_some() {
+                return Err("credentials were sent before the NTLM challenge".to_string());
+            }
+            requests.push(first);
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+
+            let second = read_async_http_request(&mut stream).await?;
+            let negotiate = ntlm_authorization_token(&second, 1);
+            requests.push(second);
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: NTLM {NTLM_CHALLENGE}\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+
+            let third = read_async_http_request(&mut stream).await?;
+            let authenticate = ntlm_authorization_token(&third, 3);
+            requests.push(third);
+            if !verify_ntlm_authenticate(
+                &negotiate,
+                &authenticate,
+                "DOMAIN\\user",
+                "cbt-password",
+                Some(&expected_channel_bindings),
+            ) {
+                return Err("HTTPS NTLM credentials or channel binding were invalid".to_string());
+            }
+            stream
+                .write_all(OK_RESPONSE)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(requests)
+        })
+        .await
+        .map_err(|_| "HTTPS NTLM fixture timed out".to_string())?
+    });
+
+    let client = build_http_client_with_routing(
+        &HeaderMap::new(),
+        1,
+        2.0,
+        false,
+        30,
+        None,
+        None,
+        Arc::new(NativeCookieStore::default()),
+        &ConnectionRoutes::default(),
+        "",
+        true,
+    )
+    .unwrap();
+    let url = format!("https://{address}/protected");
+    let method = Method::GET;
+    let body = Bytes::new();
+    let filter_config = default_filter_config();
+    let auth = OriginAuth::from_config("ntlm", "DOMAIN\\user:cbt-password").unwrap();
+    let result = request_with_client(ClientRequest {
+        client: &client,
+        url: &url,
+        method: &method,
+        body: &body,
+        initial_cookie_override: None,
+        capture_redirect_history: false,
+        max_retries: 0,
+        max_body_size: 80,
+        start: Instant::now(),
+        filter_config: &filter_config,
+        skip_status_filtered_body: false,
+        origin_auth: &auth,
+        random_user_agents: None,
+    })
+    .await;
+    (result, server.await.unwrap())
+}
+
+fn run_reqwest_retry(responses: Vec<&'static [u8]>) -> NativeHttpResult {
+    run_reqwest_request(Method::GET, Bytes::new(), responses, 1).0
+}
+
+fn run_reqwest_request(
+    method: Method,
+    body: Bytes,
+    responses: Vec<&'static [u8]>,
+    max_retries: usize,
+) -> (NativeHttpResult, Vec<Vec<u8>>) {
+    run_reqwest_request_with_user_agents(method, body, responses, max_retries, None)
+}
+
+fn run_reqwest_request_with_user_agents(
+    method: Method,
+    body: Bytes,
+    responses: Vec<&'static [u8]>,
+    max_retries: usize,
+    random_user_agents: Option<&RandomUserAgentPool>,
+) -> (NativeHttpResult, Vec<Vec<u8>>) {
+    let (base_url, server, requests) = spawn_retry_body_server(responses);
+    let client = build_http_client(
+        &HeaderMap::new(),
+        1,
+        2.0,
+        false,
+        30,
+        None,
+        None,
+        Arc::new(NativeCookieStore::default()),
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let url = format!("{base_url}/retry");
+    let filter_config = default_filter_config();
+    let result = runtime.block_on(request_with_client(ClientRequest {
+        client: &client,
+        url: &url,
+        method: &method,
+        body: &body,
+        initial_cookie_override: None,
+        capture_redirect_history: false,
+        max_retries,
+        max_body_size: 80,
+        start: Instant::now() - Duration::from_secs(5),
+        filter_config: &filter_config,
+        skip_status_filtered_body: false,
+        origin_auth: &OriginAuth::None,
+        random_user_agents,
+    }));
+    server.join().unwrap();
+    let requests = Arc::try_unwrap(requests).unwrap().into_inner().unwrap();
+    (result, requests)
+}
+
+fn run_authenticated_request(
+    auth: OriginAuth,
+    responses: Vec<&'static [u8]>,
+) -> (NativeHttpResult, Vec<Vec<u8>>) {
+    let (mut results, requests) = run_authenticated_requests(auth, responses, 1);
+    (results.remove(0), requests)
+}
+
+fn run_authenticated_requests(
+    auth: OriginAuth,
+    responses: Vec<&'static [u8]>,
+    request_count: usize,
+) -> (Vec<NativeHttpResult>, Vec<Vec<u8>>) {
+    run_authenticated_requests_with_cookie(auth, responses, request_count, None, None)
+}
+
+fn run_authenticated_requests_with_cookie(
+    auth: OriginAuth,
+    responses: Vec<&'static [u8]>,
+    request_count: usize,
+    initial_cookie_override: Option<reqwest::header::HeaderValue>,
+    random_user_agents: Option<&RandomUserAgentPool>,
+) -> (Vec<NativeHttpResult>, Vec<Vec<u8>>) {
+    let (base_url, server, requests) = spawn_retry_body_server(responses);
+    let client = build_http_client(
+        &HeaderMap::new(),
+        1,
+        2.0,
+        false,
+        30,
+        None,
+        None,
+        Arc::new(NativeCookieStore::default()),
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let results = runtime.block_on(async {
+        let mut results = Vec::with_capacity(request_count);
+        let method = Method::GET;
+        let body = Bytes::new();
+        let filter_config = default_filter_config();
+        for _ in 0..request_count {
+            let url = format!("{base_url}/protected?scope=one");
+            results.push(
+                request_with_client(ClientRequest {
+                    client: &client,
+                    url: &url,
+                    method: &method,
+                    body: &body,
+                    initial_cookie_override: initial_cookie_override.clone(),
+                    capture_redirect_history: false,
+                    max_retries: 0,
+                    max_body_size: 80,
+                    start: Instant::now(),
+                    filter_config: &filter_config,
+                    skip_status_filtered_body: false,
+                    origin_auth: &auth,
+                    random_user_agents,
+                })
+                .await,
+            );
+        }
+        results
+    });
+    server.join().unwrap();
+    let requests = Arc::try_unwrap(requests).unwrap().into_inner().unwrap();
+    (results, requests)
+}
+
+fn run_raw_retry(responses: Vec<&'static [u8]>) -> NativeHttpResult {
+    run_raw_request("GET", b"", responses, 1).0
+}
+
+fn run_raw_request(
+    method: &str,
+    body: &[u8],
+    responses: Vec<&'static [u8]>,
+    max_retries: usize,
+) -> (NativeHttpResult, Vec<Vec<u8>>) {
+    run_raw_request_with_user_agents(method, body, responses, max_retries, None)
+}
+
+fn run_raw_request_with_user_agents(
+    method: &str,
+    body: &[u8],
+    responses: Vec<&'static [u8]>,
+    max_retries: usize,
+    random_user_agents: Option<&RandomUserAgentPool>,
+) -> (NativeHttpResult, Vec<Vec<u8>>) {
+    let (base_url, server, requests) = spawn_retry_body_server(responses);
+    let headers = Vec::new();
+    let connection_routes = ConnectionRoutes::default();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = runtime.block_on(raw_http_request(
+        RawHttpRequest {
+            base_url: &base_url,
+            path: "retry%1",
+            method,
+            body,
+            headers: &headers,
+            random_user_agents,
+            timeout_secs: 30.0,
+            max_body_size: 80,
+            start: Instant::now() - Duration::from_secs(5),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            cookie_store: Arc::new(NativeCookieStore::default()),
+            connection_routes: &connection_routes,
+            network_interface: "",
+        },
+        max_retries,
+        &default_filter_config(),
+    ));
+    server.join().unwrap();
+    let requests = Arc::try_unwrap(requests).unwrap().into_inner().unwrap();
+    (result, requests)
+}
+
+fn assert_final_attempt_elapsed(result: &NativeHttpResult) {
+    assert!(
+        result.elapsed_ms < 1_000.0,
+        "elapsed included an earlier failed attempt: {} ms",
+        result.elapsed_ms
+    );
+}
+
+#[test]
+fn proxy_authentication_failures_are_not_retryable() {
+    for error in [
+        "tunnel error: unsuccessful",
+        "tunnel error: proxy authorization required",
+        "SOCKS error: credentials not accepted",
+    ] {
+        assert!(is_non_retryable_proxy_error(error), "{error}");
+    }
+
+    assert!(!is_non_retryable_proxy_error("connection reset by peer"));
+}
+
+#[test]
+fn secure_cookie_from_loopback_http_is_retained_for_https_only() {
+    let store = NativeCookieStore::default();
+    let http_url = reqwest::Url::parse("http://127.0.0.1/example").unwrap();
+    let https_url = reqwest::Url::parse("https://127.0.0.1/example").unwrap();
+
+    store.add_cookie_str("secure=native; Secure; Path=/", &http_url);
+
+    assert!(store.cookies(&http_url).is_none());
+    assert_eq!(
+        store.cookies(&https_url).unwrap().to_str().unwrap(),
+        "secure=native"
+    );
+}
+
+#[test]
+fn cookies_use_longest_path_then_creation_order() {
+    let store = NativeCookieStore::default();
+    let root_url = reqwest::Url::parse("http://example.com/").unwrap();
+    let scoped_url = reqwest::Url::parse("http://example.com/scoped/check").unwrap();
+
+    store.add_cookie_str("id=root; Path=/", &root_url);
+    store.add_cookie_str("first=one; Path=/scoped/", &scoped_url);
+    store.add_cookie_str("id=scoped; Path=/scoped/", &scoped_url);
+
+    assert_eq!(
+        store.cookies(&scoped_url).unwrap().to_str().unwrap(),
+        "first=one; id=scoped; id=root"
+    );
+}
+
+#[test]
+fn single_label_domain_supercookies_are_rejected() {
+    let store = NativeCookieStore::default();
+    let source = reqwest::Url::parse("http://foo.com/set").unwrap();
+    let sibling = reqwest::Url::parse("http://bar.com/check").unwrap();
+
+    store.add_cookie_str("super=native; Domain=com; Path=/", &source);
+
+    assert!(store.cookies(&source).is_none());
+    assert!(store.cookies(&sibling).is_none());
+}
+
+#[test]
+fn dotted_parent_domain_cookie_is_shared_with_subdomains() {
+    let store = NativeCookieStore::default();
+    let source = reqwest::Url::parse("http://api.example.com/set").unwrap();
+    let sibling = reqwest::Url::parse("http://www.example.com/check").unwrap();
+
+    store.add_cookie_str("parent=native; Domain=example.com; Path=/", &source);
+
+    assert_eq!(
+        store.cookies(&sibling).unwrap().to_str().unwrap(),
+        "parent=native"
+    );
+}
+
+#[test]
+fn native_auth_configuration_builds_preemptive_headers_without_losing_password_colons() {
+    let cases = [
+        ("basic", "usér:päss:tail", "Basic dXPDqXI6cMOkc3M6dGFpbA=="),
+        ("basic", "user", "Basic dXNlcjo="),
+        ("bearer", "opaque-token", "Bearer opaque-token"),
+        (
+            "jwt",
+            "header.payload.signature",
+            "Bearer header.payload.signature",
+        ),
+    ];
+
+    for (auth_type, credential, expected) in cases {
+        let auth = OriginAuth::from_config(auth_type, credential).unwrap();
+        assert_eq!(auth.preemptive_authorization().as_deref(), Some(expected));
+    }
+}
+
+#[test]
+fn native_auth_configuration_rejects_incomplete_and_unsupported_values() {
+    for (auth_type, credential) in [("", "secret"), ("basic", ""), ("unknown", "u:p")] {
+        let error = OriginAuth::from_config(auth_type, credential)
+            .err()
+            .expect("invalid authentication configuration was accepted");
+        if !credential.is_empty() {
+            assert!(
+                !error.contains(credential),
+                "secret leaked in error: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_auth_configuration_accepts_ntlm_without_preemptive_credentials() {
+    let auth = OriginAuth::from_config("ntlm", "DOMAIN\\user:password:tail").unwrap();
+
+    assert!(matches!(auth, OriginAuth::Ntlm { .. }));
+    assert_eq!(auth.preemptive_authorization(), None);
+    assert!(auth.is_connection_bound());
+}
+
+#[test]
+fn ntlm_usernames_accept_domain_upn_and_plain_forms() {
+    assert_eq!(
+        split_username("DOMAIN\\user").unwrap(),
+        ("DOMAIN".to_string(), "user".to_string())
+    );
+    assert_eq!(
+        split_username("user@example.test").unwrap(),
+        ("example.test".to_string(), "user".to_string())
+    );
+    assert_eq!(
+        split_username("local-user").unwrap(),
+        (String::new(), "local-user".to_string())
+    );
+    for invalid in ["", "\\user", "DOMAIN\\", "user@", "@example.test"] {
+        assert!(split_username(invalid).is_err(), "accepted {invalid:?}");
+    }
+}
+
+#[test]
+fn tls_server_end_point_uses_the_certificate_signature_hash_and_rejects_garbage() {
+    let fixture = ntlm_tls_fixture();
+    let mut expected = b"tls-server-end-point:".to_vec();
+    expected.extend_from_slice(&<Sha256 as Sha2Digest>::digest(&fixture.certificate_der));
+
+    assert_eq!(
+        tls_server_end_point(&fixture.certificate_der).unwrap(),
+        expected
+    );
+    assert!(tls_server_end_point(b"not a DER certificate").is_err());
+}
+
+#[test]
+fn ntlm_challenge_selection_prefers_an_explicit_ntlm_scheme() {
+    let mut headers = HeaderMap::new();
+    headers.append(WWW_AUTHENTICATE, HeaderValue::from_static("Negotiate"));
+    headers.append(
+        WWW_AUTHENTICATE,
+        HeaderValue::from_static("Basic realm=\"test\", nTlM"),
+    );
+
+    assert_eq!(ntlm_authentication_scheme(&headers).unwrap(), Some("NTLM"));
+}
+
+#[test]
+fn malformed_ntlm_challenge_tokens_fail_closed() {
+    for challenge in ["NTLM", "NTLM not-base64!"] {
+        let mut headers = HeaderMap::new();
+        headers.insert(WWW_AUTHENTICATE, HeaderValue::from_str(challenge).unwrap());
+
+        let error = ntlm_challenge(&headers, "NTLM").unwrap_err();
+        assert!(error.starts_with("NTLM server did not return") || error.contains("invalid"));
+    }
+}
+
+#[test]
+fn ntlm_authentication_completes_on_one_connection_without_sending_the_password() {
+    let password = "ntlm-password:with-colon";
+    let (result, requests, authenticated) = run_ntlm_request(
+        "DOMAIN\\user",
+        password,
+        &format!("DOMAIN\\user:{password}"),
+    );
+
+    assert_eq!(result.status, 200, "{:?}", result.error);
+    assert!(authenticated);
+    assert_eq!(requests.len(), 3);
+    assert_eq!(request_header(&requests[0], "authorization"), None);
+    assert!(requests.iter().all(|request| {
+        request_header(request, "connection")
+            .is_some_and(|value| value.eq_ignore_ascii_case("keep-alive"))
+    }));
+    assert!(requests.iter().all(|request| !request
+        .windows(password.len())
+        .any(|value| value == password.as_bytes())));
+}
+
+#[test]
+fn ntlm_origin_authentication_works_through_an_authenticated_http_proxy() {
+    let (result, requests, authenticated) = run_ntlm_request_with_proxy(
+        "DOMAIN\\user",
+        "ntlm-password",
+        "DOMAIN\\user:ntlm-password",
+        true,
+    );
+
+    assert_eq!(result.status, 200, "{:?}", result.error);
+    assert!(authenticated);
+    assert_eq!(requests.len(), 3);
+    assert!(requests
+        .iter()
+        .all(|request| request.starts_with(b"GET http://example.test/protected HTTP/1.1\r\n")));
+    assert!(requests.iter().all(|request| {
+        request_header(request, "proxy-authorization").as_deref()
+            == Some("Basic cHJveHktdXNlcjpwcm94eS1wYXNzd29yZA==")
+    }));
+}
+
+#[test]
+fn ntlm_authentication_rejects_an_invalid_password_without_leaking_it() {
+    let wrong_password = "wrong-password-do-not-log";
+    let (result, requests, authenticated) = run_ntlm_request(
+        "DOMAIN\\user",
+        "correct-password",
+        &format!("DOMAIN\\user:{wrong_password}"),
+    );
+
+    assert_eq!(result.status, 401, "{:?}", result.error);
+    assert!(!authenticated);
+    assert_eq!(requests.len(), 3);
+    assert!(requests.iter().all(|request| {
+        !request
+            .windows(wrong_password.len())
+            .any(|value| value == wrong_password.as_bytes())
+    }));
+    assert!(!result
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains(wrong_password)));
+}
+
+#[test]
+fn https_ntlm_authentication_uses_the_server_certificate_channel_binding() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (result, server) = runtime.block_on(run_https_ntlm_request());
+
+    let requests = server.unwrap();
+    assert_eq!(result.status, 200, "{:?}", result.error);
+    assert_eq!(result.body, b"ok");
+    assert_eq!(requests.len(), 3);
+}
+
+#[test]
+fn preemptive_authentication_is_sent_by_the_native_transport() {
+    for auth in [
+        OriginAuth::from_config("basic", "user:password").unwrap(),
+        OriginAuth::from_config("bearer", "opaque-token").unwrap(),
+    ] {
+        let expected = auth.preemptive_authorization().unwrap();
+        let (result, requests) = run_authenticated_request(auth, vec![OK_RESPONSE]);
+        assert_eq!(result.status, 200);
+        assert_eq!(
+            request_header(&requests[0], "authorization"),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn digest_authentication_answers_a_valid_challenge_with_the_configured_secret() {
+    let auth = OriginAuth::from_config("digest", "digest-user:digest-password").unwrap();
+    let (result, requests) =
+        run_authenticated_request(auth, vec![DIGEST_CHALLENGE_RESPONSE, OK_RESPONSE]);
+
+    assert_eq!(result.status, 200);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(request_header(&requests[0], "authorization"), None);
+    let authorization = request_header(&requests[1], "authorization").unwrap();
+    let mut parsed = digest_auth::AuthorizationHeader::from_str(&authorization).unwrap();
+    let received_response = parsed.response.clone();
+    parsed.digest(&AuthContext::new(
+        "digest-user",
+        "digest-password",
+        "/protected?scope=one",
+    ));
+    assert_eq!(parsed.response, received_response);
+}
+
+#[test]
+fn digest_resend_reapplies_the_configured_cookie_override() {
+    let auth = OriginAuth::from_config("digest", "digest-user:digest-password").unwrap();
+    let (results, requests) = run_authenticated_requests_with_cookie(
+        auth,
+        vec![DIGEST_COOKIE_CHALLENGE_RESPONSE, OK_RESPONSE],
+        1,
+        Some(reqwest::header::HeaderValue::from_static("fixed=native")),
+        None,
+    );
+
+    assert_eq!(results[0].status, 200);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        request_header(&requests[0], "cookie").as_deref(),
+        Some("fixed=native")
+    );
+    assert_eq!(
+        request_header(&requests[1], "cookie").as_deref(),
+        Some("fixed=native")
+    );
+}
+
+#[test]
+fn digest_challenge_and_answer_keep_one_request_local_random_user_agent() {
+    let values = vec![
+        "digest-agent-one".to_string(),
+        "digest-agent-two".to_string(),
+    ];
+    let expected_pool = RandomUserAgentPool::seeded(values.clone(), 29)
+        .unwrap()
+        .unwrap();
+    let expected = expected_pool.select_text().to_string();
+    let pool = RandomUserAgentPool::seeded(values, 29).unwrap().unwrap();
+    let auth = OriginAuth::from_config("digest", "digest-user:digest-password").unwrap();
+
+    let (results, requests) = run_authenticated_requests_with_cookie(
+        auth,
+        vec![DIGEST_CHALLENGE_RESPONSE, OK_RESPONSE],
+        1,
+        None,
+        Some(&pool),
+    );
+
+    assert_eq!(results[0].status, 200);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        request_header(&requests[0], "user-agent"),
+        Some(expected.clone())
+    );
+    assert_eq!(request_header(&requests[1], "user-agent"), Some(expected));
+    assert!(request_header(&requests[1], "authorization").is_some());
+}
+
+#[test]
+fn digest_authentication_reuses_a_challenge_for_later_requests() {
+    let auth = OriginAuth::from_config("digest", "digest-user:digest-password").unwrap();
+    let (results, requests) = run_authenticated_requests(
+        auth,
+        vec![DIGEST_CHALLENGE_RESPONSE, OK_RESPONSE, OK_RESPONSE],
+        2,
+    );
+
+    assert!(results.iter().all(|result| result.status == 200));
+    assert_eq!(requests.len(), 3);
+    assert_eq!(request_header(&requests[0], "authorization"), None);
+    let first = digest_auth::AuthorizationHeader::from_str(
+        &request_header(&requests[1], "authorization").unwrap(),
+    )
+    .unwrap();
+    let second = digest_auth::AuthorizationHeader::from_str(
+        &request_header(&requests[2], "authorization").unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first.nc, 1);
+    assert_eq!(second.nc, 2);
+}
+
+#[test]
+fn malformed_digest_challenges_fail_without_leaking_credentials() {
+    let secret = "digest-user:do-not-leak-this-password";
+    let auth = OriginAuth::from_config("digest", secret).unwrap();
+    let (result, requests) =
+        run_authenticated_request(auth, vec![MALFORMED_DIGEST_CHALLENGE_RESPONSE]);
+
+    assert_eq!(requests.len(), 1);
+    let error = result.error.unwrap();
+    assert!(error.contains("Invalid Digest authentication challenge"));
+    assert!(!error.contains(secret));
+    assert!(!error.contains("do-not-leak-this-password"));
+}
+
+#[test]
+fn reqwest_redirects_preserve_every_requested_url_in_history() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let read = stream.read(&mut request).unwrap();
+            let target = std::str::from_utf8(&request[..read])
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap();
+            let response = match target {
+                "/start" => {
+                    "HTTP/1.1 302 Found\r\nLocation: /middle\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                }
+                "/middle" => {
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: /final?ok=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                }
+                "/final?ok=1" => {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                }
+                _ => panic!("unexpected request target: {target}"),
+            };
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    let base_url = format!("http://{address}");
+    let start_url = format!("{base_url}/start");
+    let client = build_http_client(
+        &HeaderMap::new(),
+        1,
+        2.0,
+        true,
+        30,
+        None,
+        None,
+        Arc::new(NativeCookieStore::default()),
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let method = Method::GET;
+    let body = Bytes::new();
+    let filter_config = default_filter_config();
+    let result = runtime.block_on(request_with_client(ClientRequest {
+        client: &client,
+        url: &start_url,
+        method: &method,
+        body: &body,
+        initial_cookie_override: None,
+        capture_redirect_history: true,
+        max_retries: 0,
+        max_body_size: 80,
+        start: std::time::Instant::now(),
+        filter_config: &filter_config,
+        skip_status_filtered_body: false,
+        origin_auth: &OriginAuth::None,
+        random_user_agents: None,
+    }));
+    server.join().unwrap();
+
+    assert_eq!(result.status, 200);
+    assert_eq!(result.final_url, format!("{base_url}/final?ok=1"));
+    assert_eq!(
+        result.history,
+        vec![start_url, format!("{base_url}/middle")]
+    );
+}
+
+#[test]
+fn reqwest_retry_elapsed_reports_only_the_successful_attempt() {
+    let result = run_reqwest_retry(vec![INCOMPLETE_BODY_RESPONSE, OK_RESPONSE]);
+
+    assert_eq!(result.status, 200);
+    assert_eq!(result.body, b"ok");
+    assert_final_attempt_elapsed(&result);
+}
+
+#[test]
+fn reqwest_exhausted_retry_elapsed_reports_only_the_final_attempt() {
+    let result = run_reqwest_retry(vec![INCOMPLETE_BODY_RESPONSE, INCOMPLETE_BODY_RESPONSE]);
+
+    assert!(result.error.is_some());
+    assert_final_attempt_elapsed(&result);
+}
+
+#[test]
+fn raw_retry_elapsed_reports_only_the_successful_attempt() {
+    let result = run_raw_retry(vec![INCOMPLETE_BODY_RESPONSE, OK_RESPONSE]);
+
+    assert_eq!(result.status, 200);
+    assert_eq!(result.body, b"ok");
+    assert_final_attempt_elapsed(&result);
+}
+
+#[test]
+fn raw_exhausted_retry_elapsed_reports_only_the_final_attempt() {
+    let result = run_raw_retry(vec![INCOMPLETE_BODY_RESPONSE, INCOMPLETE_BODY_RESPONSE]);
+
+    assert!(result.error.is_some());
+    assert_final_attempt_elapsed(&result);
+}
+
+#[test]
+fn reqwest_retries_select_a_request_local_user_agent_for_every_attempt() {
+    let values = vec![
+        "retry-agent-one".to_string(),
+        "retry-agent-two".to_string(),
+        "retry-agent-three".to_string(),
+    ];
+    let expected_pool = RandomUserAgentPool::seeded(values.clone(), 7)
+        .unwrap()
+        .unwrap();
+    let expected = [
+        expected_pool.select_text().to_string(),
+        expected_pool.select_text().to_string(),
+    ];
+    let pool = RandomUserAgentPool::seeded(values, 7).unwrap().unwrap();
+
+    let (result, requests) = run_reqwest_request_with_user_agents(
+        Method::GET,
+        Bytes::new(),
+        vec![INCOMPLETE_BODY_RESPONSE, OK_RESPONSE],
+        1,
+        Some(&pool),
+    );
+    let observed = requests
+        .iter()
+        .map(|request| request_header(request, "user-agent").unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(result.status, 200);
+    assert_eq!(observed, expected);
+}
+
+#[test]
+fn raw_retries_select_a_request_local_user_agent_for_every_attempt() {
+    let values = vec![
+        "raw-agent-one".to_string(),
+        "raw-agent-two".to_string(),
+        "raw-agent-three".to_string(),
+    ];
+    let expected_pool = RandomUserAgentPool::seeded(values.clone(), 11)
+        .unwrap()
+        .unwrap();
+    let expected = [
+        expected_pool.select_text().to_string(),
+        expected_pool.select_text().to_string(),
+    ];
+    let pool = RandomUserAgentPool::seeded(values, 11).unwrap().unwrap();
+
+    let (result, requests) = run_raw_request_with_user_agents(
+        "GET",
+        b"",
+        vec![INCOMPLETE_BODY_RESPONSE, OK_RESPONSE],
+        1,
+        Some(&pool),
+    );
+    let observed = requests
+        .iter()
+        .map(|request| request_header(request, "user-agent").unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(result.status, 200);
+    assert_eq!(observed, expected);
+}
+
+#[test]
+fn random_user_agent_selection_is_atomic_under_concurrency() {
+    let values = (0..7)
+        .map(|index| format!("concurrent-agent-{index}"))
+        .collect::<Vec<_>>();
+    let expected_pool = RandomUserAgentPool::seeded(values.clone(), 19)
+        .unwrap()
+        .unwrap();
+    let mut expected = (0..64)
+        .map(|_| expected_pool.select_text().to_string())
+        .collect::<Vec<_>>();
+    let pool = Arc::new(RandomUserAgentPool::seeded(values, 19).unwrap().unwrap());
+    let barrier = Arc::new(Barrier::new(9));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut workers = Vec::new();
+    for _ in 0..8 {
+        let pool = pool.clone();
+        let barrier = barrier.clone();
+        let observed = observed.clone();
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            let selected = (0..8)
+                .map(|_| pool.select_text().to_string())
+                .collect::<Vec<_>>();
+            observed.lock().unwrap().extend(selected);
+        }));
+    }
+    barrier.wait();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    let mut observed = Arc::try_unwrap(observed).unwrap().into_inner().unwrap();
+    expected.sort();
+    observed.sort();
+
+    assert_eq!(observed, expected);
+}
+
+#[test]
+fn invalid_random_user_agent_values_fail_before_requests_start() {
+    let error = RandomUserAgentPool::from_values(vec![
+        "valid-agent".to_string(),
+        "invalid\r\ninjected: header".to_string(),
+    ])
+    .err()
+    .unwrap();
+
+    assert!(error.starts_with("Invalid random User-Agent value:"));
+    assert!(!error.contains("injected: header"));
+}
+
+#[test]
+fn reqwest_retries_preserve_method_and_binary_body() {
+    let body = Bytes::from_static(b"value=\xff\r\nnext=line\n");
+    let (result, requests) = run_reqwest_request(
+        Method::PATCH,
+        body.clone(),
+        vec![INCOMPLETE_BODY_RESPONSE, OK_RESPONSE],
+        1,
+    );
+
+    assert_eq!(result.status, 200);
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert!(request.starts_with(b"PATCH /retry HTTP/1.1\r\n"));
+        assert!(request.ends_with(body.as_ref()));
+    }
+}
+
+#[test]
+fn raw_retries_preserve_method_and_binary_body() {
+    let body = b"value=\xff\r\nnext=line\n";
+    let (result, requests) = run_raw_request(
+        "PATCH",
+        body,
+        vec![INCOMPLETE_BODY_RESPONSE, OK_RESPONSE],
+        1,
+    );
+
+    assert_eq!(result.status, 200);
+    assert_eq!(requests.len(), 2);
+    let content_length = format!("Content-Length: {}\r\n", body.len());
+    for request in requests {
+        assert!(request.starts_with(b"PATCH /retry%1 HTTP/1.1\r\n"));
+        assert!(request
+            .windows(content_length.len())
+            .any(|window| window == content_length.as_bytes()));
+        assert!(request.ends_with(body));
+    }
+}
+
+#[test]
+fn request_target_quoting_matches_python_ascii_contract() {
+    for value in 0u8..=127 {
+        let mut path = char::from(value).to_string();
+        prepare_request_target(&mut path, "");
+        let expected = if (b'!'..=b'~').contains(&value) {
+            char::from(value).to_string()
+        } else {
+            format!("%{value:02X}")
+        };
+
+        assert_eq!(path, expected, "ASCII value {value}");
+    }
+}
+
+#[test]
+fn request_target_quotes_utf8_and_appends_query_before_fragment() {
+    let mut path = "missing page/测试#part".to_string();
+    prepare_request_target(&mut path, "scope=hello world");
+
+    assert_eq!(
+        path,
+        "missing%20page/%E6%B5%8B%E8%AF%95?scope=hello%20world#part"
+    );
+
+    let mut existing_query = "admin?existing=true#part".to_string();
+    prepare_request_target(&mut existing_query, "ignored=true");
+    assert_eq!(existing_query, "admin?existing=true#part");
+
+    let mut existing_escape = "admin%20panel".to_string();
+    prepare_request_target(&mut existing_escape, "");
+    assert_eq!(existing_escape, "admin%20panel");
+}
+
+#[test]
+fn raw_http_path_preservation_detects_targets_reqwest_may_rewrite() {
+    assert!(should_use_raw_http(
+        "http://example.com/",
+        "admin%3d..%1\\*"
+    ));
+    assert!(should_use_raw_http("http://example.com/", "admin%3d..%1*"));
+    assert!(should_use_raw_http(
+        "http://example.com/",
+        "admin/%83%5c/.."
+    ));
+    assert!(!should_use_raw_http(
+        "http://example.com/",
+        "admin%20space/%E6%B5%8B%E8%AF%95"
+    ));
+    assert!(!should_use_raw_http("http://example.com/", "admin%3d"));
+    assert!(!should_use_raw_http(
+        "https://example.com/",
+        "admin%3d..%1\\*"
+    ));
+}
+
+fn raw_response(headers: &str, body: &[u8]) -> Vec<u8> {
+    let mut response = format!("HTTP/1.1 200 OK\r\n{headers}\r\n\r\n").into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+fn compressed_body(encoding: &str, body: &[u8]) -> Vec<u8> {
+    match encoding {
+        "gzip" => {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(body).unwrap();
+            encoder.finish().unwrap()
+        }
+        "deflate" => {
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(body).unwrap();
+            encoder.finish().unwrap()
+        }
+        "br" => {
+            let mut compressed = Vec::new();
+            {
+                let mut encoder = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 22);
+                encoder.write_all(body).unwrap();
+            }
+            compressed
+        }
+        "zstd" => zstd::stream::encode_all(body, 0).unwrap(),
+        _ => panic!("unsupported test encoding: {encoding}"),
+    }
+}
+
+fn reqwest_response(body: Vec<u8>, encoding: &str) -> (reqwest::Response, HeaderPairs) {
+    let headers = vec![
+        ("Content-Encoding".to_string(), encoding.to_string()),
+        ("Content-Length".to_string(), body.len().to_string()),
+    ];
+    let response = http::Response::builder()
+        .header("Content-Encoding", encoding)
+        .header("Content-Length", body.len())
+        .body(body)
+        .unwrap()
+        .into();
+    (response, headers)
+}
+
+#[test]
+fn reqwest_response_decoder_streams_supported_content_encodings() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let plain = b"hello world";
+    let gzip = compressed_body("gzip", plain);
+    let zstd = compressed_body("zstd", plain);
+    let cases = [
+        ("identity", plain.to_vec()),
+        ("gzip", gzip.clone()),
+        ("deflate", compressed_body("deflate", plain)),
+        ("br", compressed_body("br", plain)),
+        ("zstd", ZSTD_HELLO_WORLD.to_vec()),
+        ("ZsTd", zstd.clone()),
+        ("gzip, br", compressed_body("br", &gzip)),
+        ("gzip, zstd", compressed_body("zstd", &gzip)),
+        ("zstd, gzip", compressed_body("gzip", &zstd)),
+    ];
+
+    for (encoding, compressed) in cases {
+        let (response, headers) = reqwest_response(compressed, encoding);
+        let (body, length) = runtime
+            .block_on(read_response_body(response, &headers, 5))
+            .unwrap();
+
+        assert_eq!(body, b"hello");
+        assert_eq!(length, plain.len());
+    }
+}
+
+#[test]
+fn reqwest_response_decoder_rejects_unknown_or_invalid_encodings() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (unknown, unknown_headers) = reqwest_response(b"hello world".to_vec(), "compress-test");
+    let unknown_error = runtime
+        .block_on(read_response_body(unknown, &unknown_headers, 80))
+        .unwrap_err();
+    let (invalid, invalid_headers) = reqwest_response(b"not gzip".to_vec(), "gzip");
+    let invalid_error = runtime
+        .block_on(read_response_body(invalid, &invalid_headers, 80))
+        .unwrap_err();
+    let (invalid_zstd, invalid_zstd_headers) = reqwest_response(b"not zstd".to_vec(), "zstd");
+    let invalid_zstd_error = runtime
+        .block_on(read_response_body(invalid_zstd, &invalid_zstd_headers, 80))
+        .unwrap_err();
+    let (truncated_zstd, truncated_zstd_headers) = reqwest_response(
+        ZSTD_HELLO_WORLD[..ZSTD_HELLO_WORLD.len() - 1].to_vec(),
+        "zstd",
+    );
+    let truncated_zstd_error = runtime
+        .block_on(read_response_body(
+            truncated_zstd,
+            &truncated_zstd_headers,
+            80,
+        ))
+        .unwrap_err();
+
+    assert_eq!(
+        unknown_error,
+        "Unsupported HTTP Content-Encoding: compress-test"
+    );
+    assert!(invalid_error.starts_with("Failed to decode gzip response body:"));
+    assert!(invalid_zstd_error.starts_with("Failed to decode zstd response body:"));
+    assert!(truncated_zstd_error.starts_with("Failed to decode zstd response body:"));
+}
+
+#[test]
+fn raw_http_parser_decodes_chunked_body_and_tracks_decoded_length() {
+    let response = raw_response(
+        "Transfer-Encoding: chunked",
+        b"4\r\nWiki\r\n5; extension=yes\r\npedia\r\n0\r\nX-Trailer: done\r\n\r\n",
+    );
+
+    let (_, _, body, length) = parse_raw_http_response(response, 80).unwrap();
+
+    assert_eq!(body, b"Wikipedia");
+    assert_eq!(length, 9);
+}
+
+#[test]
+fn raw_http_parser_caps_chunked_body_without_losing_decoded_length() {
+    let response = raw_response(
+        "Transfer-Encoding: chunked",
+        b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n",
+    );
+
+    let (_, _, body, length) = parse_raw_http_response(response, 4).unwrap();
+
+    assert_eq!(body, b"Wiki");
+    assert_eq!(length, 9);
+}
+
+#[test]
+fn raw_http_parser_honors_content_length_and_ignores_extra_bytes() {
+    let response = raw_response("Content-Length: 4", b"bodyEXTRA");
+
+    let (_, _, body, length) = parse_raw_http_response(response, 80).unwrap();
+
+    assert_eq!(body, b"body");
+    assert_eq!(length, 4);
+}
+
+#[test]
+fn raw_http_parser_rejects_truncated_content_length() {
+    let response = raw_response("Content-Length: 5", b"four");
+
+    let error = parse_raw_http_response(response, 80).unwrap_err();
+
+    assert!(error.contains("ended before Content-Length"));
+}
+
+#[test]
+fn raw_http_parser_rejects_truncated_chunked_body() {
+    let response = raw_response("Transfer-Encoding: chunked", b"5\r\nfour");
+
+    let error = parse_raw_http_response(response, 80).unwrap_err();
+
+    assert!(error.contains("chunked body"));
+}
+
+#[test]
+fn raw_http_parser_decodes_gzip_before_body_filters() {
+    let gzip_hello_world = [
+        31, 139, 8, 0, 0, 0, 0, 0, 2, 3, 203, 72, 205, 201, 201, 87, 40, 207, 47, 202, 73, 1, 0,
+        133, 17, 74, 13, 11, 0, 0, 0,
+    ];
+    let response = raw_response(
+        &format!(
+            "Content-Encoding: gzip\r\nContent-Length: {}",
+            gzip_hello_world.len()
+        ),
+        &gzip_hello_world,
+    );
+
+    let (_, _, body, length) = parse_raw_http_response(response, 80).unwrap();
+
+    assert_eq!(body, b"hello world");
+    assert_eq!(length, 11);
+}
+
+#[test]
+fn raw_http_parser_decodes_stacked_content_encodings() {
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(b"hello world").unwrap();
+    let gzip = gzip.finish().unwrap();
+    let mut compressed = Vec::new();
+    {
+        let mut brotli = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 22);
+        brotli.write_all(&gzip).unwrap();
+    }
+    let response = raw_response("Content-Encoding: gzip, br", &compressed);
+
+    let (_, _, body, length) = parse_raw_http_response(response, 80).unwrap();
+
+    assert_eq!(body, b"hello world");
+    assert_eq!(length, 11);
+}
+
+#[test]
+fn raw_http_parser_decodes_zstd_before_body_filters() {
+    let response = raw_response(
+        &format!(
+            "Content-Encoding: zstd\r\nContent-Length: {}",
+            ZSTD_HELLO_WORLD.len()
+        ),
+        ZSTD_HELLO_WORLD,
+    );
+
+    let (_, _, body, length) = parse_raw_http_response(response, 5).unwrap();
+
+    assert_eq!(body, b"hello");
+    assert_eq!(length, 11);
+}
+
+#[test]
+fn raw_http_parser_decodes_zstd_in_stacked_encoding_positions() {
+    let gzip = compressed_body("gzip", b"hello world");
+    let zstd = compressed_body("zstd", b"hello world");
+    let cases = [
+        ("gzip, zstd", compressed_body("zstd", &gzip)),
+        ("zstd, gzip", compressed_body("gzip", &zstd)),
+    ];
+
+    for (encoding, compressed) in cases {
+        let response = raw_response(&format!("Content-Encoding: {encoding}"), &compressed);
+        let (_, _, body, length) = parse_raw_http_response(response, 80).unwrap();
+
+        assert_eq!(body, b"hello world", "{encoding}");
+        assert_eq!(length, 11, "{encoding}");
+    }
+}
+
+#[test]
+fn raw_http_parser_rejects_invalid_zstd() {
+    for compressed in [
+        b"not zstd".as_slice(),
+        &ZSTD_HELLO_WORLD[..ZSTD_HELLO_WORLD.len() - 1],
+    ] {
+        let response = raw_response("Content-Encoding: zstd", compressed);
+        let error = parse_raw_http_response(response, 80).unwrap_err();
+
+        assert!(error.starts_with("Failed to decode zstd response body:"));
+    }
+}
+
+#[test]
+fn raw_http_parser_decodes_zlib_wrapped_deflate() {
+    let mut deflate = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    deflate.write_all(b"hello world").unwrap();
+    let compressed = deflate.finish().unwrap();
+    let response = raw_response("Content-Encoding: deflate", &compressed);
+
+    let (_, _, body, length) = parse_raw_http_response(response, 80).unwrap();
+
+    assert_eq!(body, b"hello world");
+    assert_eq!(length, 11);
+}
+
+#[test]
+fn raw_http_parser_rejects_ambiguous_message_framing() {
+    let response = raw_response(
+        "Content-Length: 4\r\nTransfer-Encoding: chunked",
+        b"4\r\nbody\r\n0\r\n\r\n",
+    );
+
+    let error = parse_raw_http_response(response, 80).unwrap_err();
+
+    assert!(error.contains("both Transfer-Encoding and Content-Length"));
+}
+
+#[test]
+fn raw_http_parser_bounds_response_headers() {
+    let response = raw_response(&format!("X-Large: {}", "a".repeat(70 * 1024)), b"");
+
+    let error = parse_raw_http_response(response, 80).unwrap_err();
+
+    assert!(error.contains("HTTP header line exceeded"));
+}
+
+#[test]
+fn raw_http_parser_skips_informational_response() {
+    let response =
+        b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec();
+
+    let (status, _, body, length) = parse_raw_http_response(response, 80).unwrap();
+
+    assert_eq!(status, 200);
+    assert_eq!(body, b"ok");
+    assert_eq!(length, 2);
+}
+
+#[test]
+fn status_filter_returns_empty_body_with_metadata() {
+    let mut config = default_filter_config();
+    config.exclude_status_codes = vec![404];
+
+    let result = native_http_result(
+        "missing".to_string(),
+        404,
+        content_length(64),
+        b"not found body".to_vec(),
+        25.0,
+        &config,
+    );
+
+    assert!(result.filtered);
+    assert_eq!(result.filter_reason.as_deref(), Some("exclude_status"));
+    assert_eq!(result.length, 64);
+    assert_eq!(result.elapsed_ms, 25.0);
+    assert!(result.body.is_empty());
+}
+
+#[test]
+fn advanced_matchers_and_filters_respect_modes() {
+    let mut config = default_filter_config();
+    config.matcher_mode = "and".to_string();
+    config.filter_mode = "or".to_string();
+    config.match_status_codes = vec![200];
+    config.match_words = vec![(2, 2)];
+    config.match_lines = vec![(1, 1)];
+    config.match_time = vec![(">".to_string(), 10.0)];
+    config.filter_regex = compile_regex(Some("not found".to_string()), "--filter-regex").unwrap();
+
+    let keep = native_http_result(
+        "admin".to_string(),
+        200,
+        Vec::new(),
+        b"admin panel".to_vec(),
+        20.0,
+        &config,
+    );
+    assert!(!keep.filtered);
+    assert_eq!(keep.body, b"admin panel");
+
+    let filtered = native_http_result(
+        "missing".to_string(),
+        200,
+        Vec::new(),
+        b"not found".to_vec(),
+        20.0,
+        &config,
+    );
+    assert!(filtered.filtered);
+    assert_eq!(filtered.filter_reason.as_deref(), Some("advanced_filter"));
+    assert!(filtered.body.is_empty());
+
+    let matcher_miss = native_http_result(
+        "short".to_string(),
+        200,
+        Vec::new(),
+        b"admin".to_vec(),
+        20.0,
+        &config,
+    );
+    assert!(matcher_miss.filtered);
+    assert_eq!(
+        matcher_miss.filter_reason.as_deref(),
+        Some("advanced_matcher")
+    );
+}
+
+#[test]
+fn advanced_filter_and_mode_requires_all_checks() {
+    let mut config = default_filter_config();
+    config.filter_mode = "and".to_string();
+    config.filter_status_codes = vec![404];
+    config.filter_sizes = vec![(10, 20)];
+
+    let filtered = native_http_result(
+        "missing".to_string(),
+        404,
+        content_length(12),
+        b"not found".to_vec(),
+        1.0,
+        &config,
+    );
+    assert!(filtered.filtered);
+    assert_eq!(filtered.filter_reason.as_deref(), Some("advanced_filter"));
+
+    let keep = native_http_result(
+        "small".to_string(),
+        404,
+        content_length(5),
+        b"small".to_vec(),
+        1.0,
+        &config,
+    );
+    assert!(!keep.filtered);
+}
+
+#[test]
+fn non_utf8_text_filters_are_deferred_to_python() {
+    let mut config = default_filter_config();
+    config.match_regex = compile_regex(Some("£".to_string()), "--match-regex").unwrap();
+    let body = b"price \xa3".to_vec();
+
+    let result = native_http_result(
+        "price".to_string(),
+        200,
+        vec![(
+            "Content-Type".to_string(),
+            "text/plain; Charset=\"windows-1252\"".to_string(),
+        )],
+        body.clone(),
+        1.0,
+        &config,
+    );
+
+    assert!(!result.filtered);
+    assert_eq!(result.filter_reason, None);
+    assert_eq!(result.body, body);
+}
+
+#[test]
+fn utf8_text_filters_keep_the_native_fast_path() {
+    let mut config = default_filter_config();
+    config.filter_regex = compile_regex(Some("£".to_string()), "--filter-regex").unwrap();
+
+    let result = native_http_result(
+        "price".to_string(),
+        200,
+        vec![(
+            "Content-Type".to_string(),
+            "text/plain; Charset=UTF_8".to_string(),
+        )],
+        "price £".as_bytes().to_vec(),
+        1.0,
+        &config,
+    );
+
+    assert!(result.filtered);
+    assert_eq!(result.filter_reason.as_deref(), Some("advanced_filter"));
+    assert!(result.body.is_empty());
+}
+
+#[test]
+fn advanced_header_matchers_and_filters_work() {
+    let mut config = default_filter_config();
+    config.match_headers = vec!["etag: w/\"123".to_string()];
+    config.filter_header_regex = compile_header_regex(
+        Some("X-Cache: fallback-[0-9]+".to_string()),
+        "--filter-header-regex",
+    )
+    .unwrap();
+
+    let keep = native_http_result(
+        "real".to_string(),
+        200,
+        vec![
+            ("ETag".to_string(), "W/\"123-abc\"".to_string()),
+            ("X-Cache".to_string(), "real".to_string()),
+        ],
+        b"same body".to_vec(),
+        1.0,
+        &config,
+    );
+    assert!(!keep.filtered);
+
+    let filtered = native_http_result(
+        "fallback".to_string(),
+        200,
+        vec![
+            ("ETag".to_string(), "W/\"123-abc\"".to_string()),
+            ("X-Cache".to_string(), "fallback-404".to_string()),
+        ],
+        b"same body".to_vec(),
+        1.0,
+        &config,
+    );
+    assert!(filtered.filtered);
+    assert_eq!(filtered.filter_reason.as_deref(), Some("advanced_filter"));
+
+    let matcher_miss = native_http_result(
+        "missing-header".to_string(),
+        200,
+        vec![("X-Cache".to_string(), "real".to_string())],
+        b"same body".to_vec(),
+        1.0,
+        &config,
+    );
+    assert!(matcher_miss.filtered);
+    assert_eq!(
+        matcher_miss.filter_reason.as_deref(),
+        Some("advanced_matcher")
+    );
+}
+
+#[test]
+fn regex_compile_errors_are_reported() {
+    let error = NativeFilterConfig::from_options(
+        Vec::new(),
+        Vec::new(),
+        0,
+        0,
+        "or".to_string(),
+        "or".to_string(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Some("(".to_string()),
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+    )
+    .err()
+    .unwrap();
+
+    assert!(error.contains("Invalid --match-regex regular expression"));
+}
+
+#[test]
+fn python_lookarounds_execute_in_native_filters() {
+    for (pattern, body) in [
+        (r"(?=admin)admin", b"admin panel".as_slice()),
+        (r"(?<=token=)secret", b"token=secret".as_slice()),
+        (r"admin(?!istrator)", b"admin panel".as_slice()),
+        (r"(?<!super)admin", b"plain admin".as_slice()),
+    ] {
+        let mut config = default_filter_config();
+        config.filter_regex = compile_regex(Some(pattern.to_string()), "--filter-regex").unwrap();
+
+        let result = native_http_result(
+            "advanced".to_string(),
+            200,
+            Vec::new(),
+            body.to_vec(),
+            1.0,
+            &config,
+        );
+
+        assert!(result.filtered, "pattern did not match: {pattern}");
+    }
+}
+
+#[test]
+fn python_backreferences_execute_in_native_filters() {
+    for (pattern, body) in [
+        (r"\b([a-z]+)\s+\1\b", b"the the".as_slice()),
+        (
+            r"\b(?P<word>[a-z]+)\s+(?P=word)\b",
+            b"repeat repeat".as_slice(),
+        ),
+    ] {
+        let mut config = default_filter_config();
+        config.filter_regex = compile_regex(Some(pattern.to_string()), "--filter-regex").unwrap();
+
+        let result = native_http_result(
+            "advanced".to_string(),
+            200,
+            Vec::new(),
+            body.to_vec(),
+            1.0,
+            &config,
+        );
+
+        assert!(result.filtered, "pattern did not match: {pattern}");
+    }
+}
+
+#[test]
+fn python_header_backreferences_remain_case_insensitive() {
+    let mut config = default_filter_config();
+    config.filter_header_regex = compile_header_regex(
+        Some(r"x-token: (?P<value>[a-z]+)-(?P=value)".to_string()),
+        "--filter-header-regex",
+    )
+    .unwrap();
+
+    let result = native_http_result(
+        "advanced".to_string(),
+        200,
+        vec![("X-Token".to_string(), "Secret-secret".to_string())],
+        b"body".to_vec(),
+        1.0,
+        &config,
+    );
+
+    assert!(result.filtered);
+}
+
+#[test]
+fn advanced_regex_backtracking_limit_becomes_a_scan_error() {
+    let mut config = default_filter_config();
+    config.filter_regex =
+        compile_regex(Some(r"^(a|aa)+\1b$".to_string()), "--filter-regex").unwrap();
+    let mut body = vec![b'a'; 128];
+    body.push(b'c');
+
+    let result = native_http_result("bounded".to_string(), 200, Vec::new(), body, 1.0, &config);
+
+    assert!(result
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("backtracking count exceeded")));
+    assert!(!result.filtered);
+    assert!(result.body.is_empty());
+}
+
+#[test]
+fn body_chunks_are_capped_without_losing_transferred_length() {
+    let chunks: [&[u8]; 3] = [b"abc", b"defg", b"hijkl"];
+    let mut body = Vec::new();
+    let mut body_length = 0usize;
+
+    for chunk in chunks {
+        body_length = body_length.saturating_add(chunk.len());
+        append_body_chunk(&mut body, chunk, 6);
+    }
+
+    assert_eq!(body, b"abcdef");
+    assert_eq!(body_length, 12);
+}
+
+#[test]
+fn truncated_body_keeps_transferred_response_length() {
+    let config = default_filter_config();
+    let result = native_http_result_with_length(
+        "large".to_string(),
+        200,
+        Vec::new(),
+        b"abcdef".to_vec(),
+        1024,
+        1.0,
+        &config,
+    );
+
+    assert_eq!(result.length, 1024);
+    assert_eq!(result.body, b"abcdef");
+    assert!(!result.body_complete);
+}
+
+#[test]
+fn runtime_workers_follow_available_cpu_bounds() {
+    assert!((1..=256).contains(&runtime_worker_count()));
+}
+
+#[test]
+fn every_supported_proxy_client_configuration_builds() {
+    for proxy in [
+        "http://user:password@127.0.0.1:8080",
+        "https://user:password@127.0.0.1:8443",
+        "socks4://127.0.0.1:1080",
+        "socks4a://127.0.0.1:1080",
+        "socks5://user:password@127.0.0.1:1080",
+        "socks5h://user:password@127.0.0.1:1080",
+    ] {
+        let client = build_http_client(
+            &HeaderMap::new(),
+            25,
+            1.0,
+            false,
+            30,
+            Some(proxy),
+            None,
+            Arc::new(NativeCookieStore::default()),
+        );
+
+        assert!(client.is_ok(), "{proxy}");
+    }
+}
+
+#[test]
+fn proxied_requests_receive_request_local_random_user_agents() {
+    let (proxy_url, server, requests) = spawn_retry_body_server(vec![OK_RESPONSE]);
+    let client = build_http_client(
+        &HeaderMap::new(),
+        1,
+        2.0,
+        false,
+        30,
+        Some(&proxy_url),
+        None,
+        Arc::new(NativeCookieStore::default()),
+    )
+    .unwrap();
+    let values = vec!["proxy-agent".to_string()];
+    let pool = RandomUserAgentPool::seeded(values, 23).unwrap().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let method = Method::GET;
+    let body = Bytes::new();
+    let filter_config = default_filter_config();
+    let result = runtime.block_on(request_with_client(ClientRequest {
+        client: &client,
+        url: "http://example.test/proxy-path",
+        method: &method,
+        body: &body,
+        initial_cookie_override: None,
+        capture_redirect_history: false,
+        max_retries: 0,
+        max_body_size: 80,
+        start: Instant::now(),
+        filter_config: &filter_config,
+        skip_status_filtered_body: false,
+        origin_auth: &OriginAuth::None,
+        random_user_agents: Some(&pool),
+    }));
+    server.join().unwrap();
+    let requests = Arc::try_unwrap(requests).unwrap().into_inner().unwrap();
+
+    assert_eq!(result.status, 200);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        request_header(&requests[0], "user-agent").as_deref(),
+        Some("proxy-agent")
+    );
+}
+
+struct PemIdentity {
+    certificate: Vec<u8>,
+    key: Vec<u8>,
+}
+
+struct MutualTlsFixture {
+    server_config: Arc<ServerConfig>,
+    trusted_client: PemIdentity,
+    untrusted_client: PemIdentity,
+    wrong_usage_client: PemIdentity,
+    expired_client: PemIdentity,
+    unrelated_key: Vec<u8>,
+}
+
+fn mutual_tls_fixture() -> MutualTlsFixture {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+    ];
+    let ca_key = KeyPair::generate().unwrap();
+    let ca_certificate = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let server_key = KeyPair::generate().unwrap();
+    let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let server_certificate = server_params.signed_by(&server_key, &issuer).unwrap();
+
+    let client_key = KeyPair::generate().unwrap();
+    let mut client_params = CertificateParams::new(vec!["dirsearch-client".to_string()]).unwrap();
+    client_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let client_certificate = client_params.signed_by(&client_key, &issuer).unwrap();
+
+    let unrelated_key = KeyPair::generate().unwrap().serialize_pem().into_bytes();
+
+    let wrong_usage_key = KeyPair::generate().unwrap();
+    let mut wrong_usage_params =
+        CertificateParams::new(vec!["wrong-usage-client".to_string()]).unwrap();
+    wrong_usage_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    wrong_usage_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let wrong_usage_certificate = wrong_usage_params
+        .signed_by(&wrong_usage_key, &issuer)
+        .unwrap();
+
+    let expired_key = KeyPair::generate().unwrap();
+    let mut expired_params = CertificateParams::new(vec!["expired-client".to_string()]).unwrap();
+    expired_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    expired_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    expired_params.not_before = date_time_ymd(2000, 1, 1);
+    expired_params.not_after = date_time_ymd(2001, 1, 1);
+    let expired_certificate = expired_params.signed_by(&expired_key, &issuer).unwrap();
+
+    let mut untrusted_ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    untrusted_ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    untrusted_ca_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+    ];
+    let untrusted_ca_key = KeyPair::generate().unwrap();
+    let untrusted_issuer = Issuer::new(untrusted_ca_params, untrusted_ca_key);
+    let untrusted_key = KeyPair::generate().unwrap();
+    let mut untrusted_params =
+        CertificateParams::new(vec!["untrusted-client".to_string()]).unwrap();
+    untrusted_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    untrusted_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let untrusted_certificate = untrusted_params
+        .signed_by(&untrusted_key, &untrusted_issuer)
+        .unwrap();
+
+    let mut client_roots = RootCertStore::empty();
+    client_roots.add(ca_certificate.der().clone()).unwrap();
+    let verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
+        .build()
+        .unwrap();
+    let server_key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der()));
+    let server_config = ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(vec![server_certificate.der().clone()], server_key_der)
+        .unwrap();
+
+    MutualTlsFixture {
+        server_config: Arc::new(server_config),
+        trusted_client: PemIdentity {
+            certificate: client_certificate.pem().into_bytes(),
+            key: client_key.serialize_pem().into_bytes(),
+        },
+        untrusted_client: PemIdentity {
+            certificate: untrusted_certificate.pem().into_bytes(),
+            key: untrusted_key.serialize_pem().into_bytes(),
+        },
+        wrong_usage_client: PemIdentity {
+            certificate: wrong_usage_certificate.pem().into_bytes(),
+            key: wrong_usage_key.serialize_pem().into_bytes(),
+        },
+        expired_client: PemIdentity {
+            certificate: expired_certificate.pem().into_bytes(),
+            key: expired_key.serialize_pem().into_bytes(),
+        },
+        unrelated_key,
+    }
+}
+
+async fn run_mutual_tls_request(
+    fixture: &MutualTlsFixture,
+    client_certificate: &[u8],
+    client_key: &[u8],
+) -> (NativeHttpResult, Result<(), String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::TlsAcceptor;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let acceptor = TlsAcceptor::from(fixture.server_config.clone());
+    let server = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(3), async move {
+            let (stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
+            let mut stream = acceptor
+                .accept(stream)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0u8; 1024];
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if read == 0 {
+                    return Err("client closed before sending a request".to_string());
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            if !request.starts_with(b"GET /mtls HTTP/1.1\r\n") {
+                return Err("unexpected mutual TLS request target".to_string());
+            }
+            stream
+                .write_all(OK_RESPONSE)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| "mutual TLS fixture timed out".to_string())?
+    });
+
+    let client = build_http_client(
+        &HeaderMap::new(),
+        1,
+        2.0,
+        false,
+        30,
+        None,
+        (!client_certificate.is_empty() || !client_key.is_empty())
+            .then_some((client_certificate, client_key)),
+        Arc::new(NativeCookieStore::default()),
+    )
+    .unwrap();
+    let url = format!("https://{address}/mtls");
+    let method = Method::GET;
+    let body = Bytes::new();
+    let filter_config = default_filter_config();
+    let result = request_with_client(ClientRequest {
+        client: &client,
+        url: &url,
+        method: &method,
+        body: &body,
+        initial_cookie_override: None,
+        capture_redirect_history: false,
+        max_retries: 0,
+        max_body_size: 80,
+        start: Instant::now(),
+        filter_config: &filter_config,
+        skip_status_filtered_body: false,
+        origin_auth: &OriginAuth::None,
+        random_user_agents: None,
+    })
+    .await;
+    (result, server.await.unwrap())
+}
+
+#[test]
+fn client_identity_is_required_and_sent_during_tls_handshake() {
+    let fixture = mutual_tls_fixture();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let (anonymous_result, anonymous_server) =
+        runtime.block_on(run_mutual_tls_request(&fixture, b"", b""));
+    assert!(anonymous_result.error.is_some());
+    assert!(anonymous_server.is_err());
+
+    let (authenticated_result, authenticated_server) = runtime.block_on(run_mutual_tls_request(
+        &fixture,
+        &fixture.trusted_client.certificate,
+        &fixture.trusted_client.key,
+    ));
+    authenticated_server.unwrap();
+    assert_eq!(authenticated_result.status, 200);
+    assert_eq!(authenticated_result.body, b"ok");
+}
+
+#[test]
+fn malformed_or_incomplete_client_identity_fails_during_client_construction() {
+    let fixture = mutual_tls_fixture();
+    let encrypted_key =
+        b"-----BEGIN ENCRYPTED PRIVATE KEY-----\nYWJj\n-----END ENCRYPTED PRIVATE KEY-----\n";
+    let invalid_cases: [(&str, &[u8], &[u8]); 7] = [
+        (
+            "malformed certificate",
+            b"not a certificate",
+            &fixture.trusted_client.key,
+        ),
+        (
+            "malformed private key",
+            &fixture.trusted_client.certificate,
+            b"not a private key",
+        ),
+        ("missing certificate", b"", &fixture.trusted_client.key),
+        (
+            "missing private key",
+            &fixture.trusted_client.certificate,
+            b"",
+        ),
+        (
+            "certificate provided as private key",
+            &fixture.trusted_client.certificate,
+            &fixture.trusted_client.certificate,
+        ),
+        (
+            "private key provided as certificate",
+            &fixture.trusted_client.key,
+            &fixture.trusted_client.key,
+        ),
+        (
+            "encrypted private key",
+            &fixture.trusted_client.certificate,
+            encrypted_key,
+        ),
+    ];
+
+    for (case, certificate, key) in invalid_cases {
+        let error = build_http_client(
+            &HeaderMap::new(),
+            1,
+            2.0,
+            false,
+            30,
+            None,
+            Some((certificate, key)),
+            Arc::new(NativeCookieStore::default()),
+        )
+        .expect_err(case);
+
+        assert!(
+            error.contains("Invalid client certificate or private key"),
+            "{case}: {error}"
+        );
+        assert!(!error.contains("not a private key"), "{case}: {error}");
+        assert!(!error.contains("YWJj"), "{case}: {error}");
+    }
+}
+
+#[test]
+fn client_certificate_and_unrelated_valid_key_are_rejected() {
+    let fixture = mutual_tls_fixture();
+    let error = build_http_client(
+        &HeaderMap::new(),
+        1,
+        2.0,
+        false,
+        30,
+        None,
+        Some((&fixture.trusted_client.certificate, &fixture.unrelated_key)),
+        Arc::new(NativeCookieStore::default()),
+    )
+    .expect_err("a certificate paired with another valid key was accepted");
+
+    assert!(
+        error.contains("Invalid client certificate or private key"),
+        "{error}"
+    );
+}
+
+#[test]
+fn valid_but_unauthorized_client_certificates_fail_the_tls_handshake() {
+    let fixture = mutual_tls_fixture();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    for (case, identity) in [
+        ("untrusted issuer", &fixture.untrusted_client),
+        (
+            "server-only extended key usage",
+            &fixture.wrong_usage_client,
+        ),
+        ("expired certificate", &fixture.expired_client),
+    ] {
+        let (result, server) = runtime.block_on(run_mutual_tls_request(
+            &fixture,
+            &identity.certificate,
+            &identity.key,
+        ));
+
+        assert!(result.error.is_some(), "{case} was accepted by the client");
+        assert!(server.is_err(), "{case} was accepted by the server");
+    }
+}
+
+#[test]
+fn response_length_prefers_content_length_header() {
+    assert_eq!(response_length(&content_length(123), 2), 123);
+    assert_eq!(response_length(&[], 2), 2);
+}

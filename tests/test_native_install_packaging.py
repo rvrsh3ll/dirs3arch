@@ -1,0 +1,230 @@
+import os
+import tomllib
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest import TestCase
+from unittest.mock import patch
+
+from lib.core.native_builder import install_hint
+from lib.core.native_runtime import (
+    NATIVE_EXTENSION_VERSION,
+    get_native_backend_install_error,
+)
+from scripts.build_native import install_native_wheel, resolve_python
+
+
+class TestNativeInstallPackaging(TestCase):
+    def test_setuptools_build_floor_is_patched_and_not_runtime(self):
+        minimum_safe_version = (83, 0, 0)
+        root_requirements = Path("requirements.txt").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        runtime_requirements = Path("requirements/runtime.txt").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+        pinned = next(
+            requirement
+            for requirement in root_requirements
+            if requirement.lower().startswith("setuptools==")
+        )
+        build_floor = next(
+            requirement
+            for requirement in pyproject["build-system"]["requires"]
+            if requirement.lower().startswith("setuptools>=")
+        )
+
+        self.assertGreaterEqual(
+            tuple(int(part) for part in pinned.partition("==")[2].split(".")),
+            minimum_safe_version,
+        )
+        self.assertGreaterEqual(
+            tuple(int(part) for part in build_floor.partition(">=")[2].split(".")),
+            minimum_safe_version,
+        )
+        self.assertFalse(
+            any(
+                requirement.lower().startswith("setuptools")
+                for requirement in runtime_requirements
+            )
+        )
+
+    def test_native_package_versions_match_python_contract(self):
+        cargo = tomllib.loads(Path("native/Cargo.toml").read_text(encoding="utf-8"))
+        pyproject = tomllib.loads(
+            Path("native/pyproject.toml").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(cargo["package"]["version"], NATIVE_EXTENSION_VERSION)
+        self.assertEqual(pyproject["project"]["version"], NATIVE_EXTENSION_VERSION)
+
+    def test_native_rust_msrv_matches_user_guidance(self):
+        cargo = tomllib.loads(Path("native/Cargo.toml").read_text(encoding="utf-8"))
+        expected_guidance = "Rust 1.88 or newer"
+
+        self.assertEqual(cargo["package"]["rust-version"], "1.88")
+        self.assertIn(expected_guidance, install_hint({}))
+        self.assertIn(
+            expected_guidance,
+            get_native_backend_install_error((3, 14, 0)),
+        )
+        for path in (
+            Path("docs/building.md"),
+            Path("docs/installation.md"),
+            Path("native/README.md"),
+        ):
+            with self.subTest(path=str(path)):
+                self.assertIn(expected_guidance, path.read_text(encoding="utf-8"))
+
+    def test_native_ci_enforces_msrv_and_clippy(self):
+        workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+        self.assertIn("uses: dtolnay/rust-toolchain@1.88.0", workflow)
+        self.assertIn("components: rustfmt, clippy", workflow)
+        self.assertIn(
+            "cargo clippy --locked --manifest-path native/Cargo.toml "
+            "--all-targets -- -D warnings",
+            workflow,
+        )
+
+    def test_native_dependency_audit_is_automatic_and_read_only(self):
+        workflow = Path(".github/workflows/rust-security.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("schedule:", workflow)
+        self.assertIn("permissions:\n  contents: read", workflow)
+        self.assertIn("uses: dtolnay/rust-toolchain@1.88.0", workflow)
+        self.assertIn(
+            "cargo install cargo-audit --version 0.22.2 --locked",
+            workflow,
+        )
+        self.assertIn("cargo audit --file native/Cargo.lock", workflow)
+
+    def test_async_socks_dependency_is_packaged(self):
+        for path in (
+            Path("requirements.txt"),
+            Path("requirements/runtime.txt"),
+        ):
+            with self.subTest(path=str(path)):
+                self.assertIn(
+                    "socksio==1.0.0",
+                    path.read_text(encoding="utf-8").splitlines(),
+                )
+
+        self.assertIn(
+            "'socksio'",
+            Path("pyinstaller/dirsearch.spec").read_text(encoding="utf-8"),
+        )
+
+    def test_entrypoints_include_native_builder(self):
+        self.assertIn(
+            'dirsearch-build-native = "dirsearch.lib.core.native_builder:main"',
+            Path("pyproject.toml").read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "dirsearch-build-native=dirsearch.lib.core.native_builder:main",
+            Path("setup.py").read_text(encoding="utf-8"),
+        )
+
+    def test_package_data_includes_native_sources(self):
+        setup_py = Path("setup.py").read_text(encoding="utf-8")
+
+        self.assertIn('*package_files(ROOT / "native")', setup_py)
+        self.assertIn('"target"', setup_py)
+
+    def test_setup_uses_standard_package_dir_mapping(self):
+        setup_py = Path("setup.py").read_text(encoding="utf-8")
+
+        self.assertIn('"dirsearch": "."', setup_py)
+        self.assertIn('"dirsearch.lib": "lib"', setup_py)
+        self.assertNotIn("tempfile.mkdtemp", setup_py)
+        self.assertNotIn("shutil.copytree", setup_py)
+        self.assertNotIn("os.chdir", setup_py)
+
+    def test_ntlm_auth_is_not_a_direct_dependency(self):
+        requirement_files = (
+            Path("requirements.txt"),
+            Path("requirements/runtime.txt"),
+        )
+
+        for path in requirement_files:
+            with self.subTest(path=str(path)):
+                self.assertNotIn(
+                    "ntlm-auth",
+                    path.read_text(encoding="utf-8"),
+                )
+        self.assertNotIn(
+            "ntlm_auth",
+            Path("pyinstaller/dirsearch.spec").read_text(encoding="utf-8"),
+        )
+
+    def test_macos_pyinstaller_omits_mysql_vendor_openssl(self):
+        pyinstaller_spec = Path("pyinstaller/dirsearch.spec").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('if sys.platform == "darwin":', pyinstaller_spec)
+        self.assertIn(
+            'excluded_imports.append("_mysql_connector")',
+            pyinstaller_spec,
+        )
+        self.assertIn('startswith("mysql/vendor/")', pyinstaller_spec)
+        self.assertIn('startswith("_mysql_connector")', pyinstaller_spec)
+
+    def test_portable_workflow_uses_github_token(self):
+        workflow = Path(".github/workflows/portable-builds.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("GITHUB_TOKEN: ${{ github.token }}", workflow)
+
+    def test_install_docs_use_native_builder_flow(self):
+        docs = Path("docs/installation.md").read_text(encoding="utf-8")
+
+        self.assertIn("dirsearch-build-native", docs)
+        self.assertIn("python3.14-dev", docs)
+        self.assertIn("python3.14-devel", docs)
+        self.assertNotIn("maturin develop", docs)
+
+    def test_pyinstaller_native_build_uses_selected_python(self):
+        build_script = Path("pyinstaller/build.sh").read_text(encoding="utf-8")
+
+        self.assertIn('${VIRTUAL_ENV:-}', build_script)
+        self.assertIn('"$PYTHON_CMD" scripts/build_native.py --python "$PYTHON_CMD"', build_script)
+
+    def test_native_builder_preserves_python_symlink(self):
+        with TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            target = temp_path / "python-real"
+            link = temp_path / "python"
+            target.touch()
+            try:
+                os.symlink(target, link)
+            except (AttributeError, NotImplementedError, OSError) as error:
+                self.skipTest(f"Python symlink unavailable: {error}")
+
+            self.assertEqual(resolve_python(str(link)), link.absolute())
+
+    def test_native_builder_force_reinstalls_and_verifies_exact_wheel(self):
+        python = Path("/usr/bin/python3.14")
+        wheel = Path(f"/tmp/dirsearch_native-{NATIVE_EXTENSION_VERSION}.whl")
+
+        with patch("scripts.build_native.run") as run:
+            install_native_wheel(python, wheel, NATIVE_EXTENSION_VERSION)
+
+        self.assertEqual(run.call_count, 2)
+        install_command = run.call_args_list[0].args[0]
+        self.assertEqual(
+            install_command[:4],
+            [str(python), "-m", "pip", "install"],
+        )
+        self.assertIn("--force-reinstall", install_command)
+        self.assertIn("--no-deps", install_command)
+        self.assertEqual(install_command[-1], str(wheel))
+
+        verify_command = run.call_args_list[1].args[0]
+        self.assertEqual(verify_command[:2], [str(python), "-c"])
+        self.assertIn("import dirsearch_native", verify_command[2])
+        self.assertIn(repr(NATIVE_EXTENSION_VERSION), verify_command[2])

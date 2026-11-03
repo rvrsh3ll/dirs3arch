@@ -9,27 +9,69 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: [3.8]
-        os: [ubuntu-18.04]
+        python-version: [3.11, 3.14]
+        os: ['ubuntu-latest', 'windows-latest']
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install flake8
+        pip install codespell flake8 -r requirements.txt
+    - name: Packaging smoke test
+      run: |
+        python -m pip install .
+        dirsearch --version
+        python tests/check_packaged_install.py
     - name: Test
       run: |
-        echo index.html > tmp
-        python3 dirsearch.py -u https://example.com -r -w tmp -q -f -e php,html,js
+        python3 dirsearch.py -w ./tests/static/wordlist.txt -u https://example.com -o "tmp_report.{extension}" -O json,xml,plain,csv,md,sqlite,html --force-recursive -R 3 --full-url -q
+        python3 dirsearch.py -w ./tests/static/wordlist.txt -l ./tests/static/targets.txt --subdirs /,admin/ --exclude-extensions conf -q -L -f -i 200 --user-agent a --log tmp_log.log
+        python3 dirsearch.py -w ./tests/static/wordlist.txt --nmap-report ./tests/static/nmap.xml --max-rate 2 -H K:V --random-agent --overwrite-extensions --no-color --filter-threshold 3
+        python3 dirsearch.py -w ./tests/static/wordlist.txt --raw ./tests/static/raw.txt --prefixes . --suffixes ~ --skip-on-status 404 -m POST -d test=1 --crawl --min-response-size 9
+        echo https://self-signed.badssl.com | python3 dirsearch.py -w ./tests/static/wordlist.txt --stdin --max-time 8 --auth u:p --auth-type basic --scheme http --target-max-time 9
+
+    - name: Unit Test
+      run: python -m unittest discover -s tests -t .
+
     - name: Lint
       run: |
-        # stop the build if there are Python syntax errors or undefined names
-        flake8 . --exclude=thirdparty --count --ignore=E501,F403,F405 --show-source --statistics
-        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
-        flake8 . --exclude=thirdparty --count --ignore=E501,F403,F405 --exit-zero --max-complexity=10 --statistics
+        flake8 .
+    - name: Codespell
+      run: codespell -S CONTRIBUTORS.md,./db/categories/*,./build
+
+  native:
+    name: Native backend
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Rust 1.88.0
+      uses: dtolnay/rust-toolchain@1.88.0
+      with:
+        components: rustfmt, clippy
+    - name: Set up Python 3.14
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.14'
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install maturin -r requirements.txt
+    - name: Check Rust formatting
+      run: cargo fmt --manifest-path native/Cargo.toml --all -- --check
+    - name: Lint Rust crate
+      run: cargo clippy --locked --manifest-path native/Cargo.toml --all-targets -- -D warnings
+    - name: Test Rust crate
+      run: cargo test --locked --manifest-path native/Cargo.toml
+    - name: Build and install native extension
+      run: python scripts/build_native.py --keep-target
+    - name: Test native Python integration
+      run: |
+        python -c "import dirsearch_native"
+        python -m unittest tests.connection.test_requester.TestNativeRequesterPathPreservation
+        python -m unittest discover -s tests -t .

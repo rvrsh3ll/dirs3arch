@@ -1,0 +1,229 @@
+from dataclasses import replace
+# -*- coding: utf-8 -*-
+
+from unittest import TestCase
+from unittest.mock import Mock, patch
+
+from lib.core.run_config import RunConfig
+from lib.controller.run_resources import RunResources
+from lib.controller.controller import Controller
+from lib.core.target_progress import TargetProgress
+from lib.core.option_defaults import default_options
+from lib.core.exceptions import QuitInterrupt, SkipTargetInterrupt
+from lib.core.execution_config import ExecutionConfig, ScanEngine
+from lib.core.scan_run_state import ScanRunState
+from lib.core.run_metadata import RunMetadata
+
+
+class RecordingForceQuitHandler:
+    def __init__(self):
+        self.pause_starts = 0
+        self.resumes = 0
+        self.force_quit_checks = 0
+
+    def check_force_quit(self, terminal):
+        self.force_quit_checks += 1
+        return False
+
+    def on_pause_start(self):
+        self.pause_starts += 1
+
+    def on_resume(self):
+        self.resumes += 1
+
+
+class RecordingPauseFuture:
+    def __init__(self):
+        self.error = None
+
+    def set_exception(self, error):
+        self.error = error
+
+
+class TestPauseState(TestCase):
+    def setUp(self):
+        self.options = default_options()
+        self.reset_controller()
+
+    def reset_controller(self):
+        self.controller = object.__new__(Controller)
+        self.controller._options = self.options
+        self.controller.resources = RunResources(interface=Mock(), logger=Mock())
+        self.controller.config = RunConfig(execution=ExecutionConfig.from_options(self.options))
+        self.controller.metadata = RunMetadata("dirsearch", "2026-10-05 23:59:59")
+        self.controller.run_state = ScanRunState()
+        self.controller.target_progress = TargetProgress()
+        self.controller.run_state.prepare_targets(self.options["urls"])
+        self.controller.run_state.activate_next()
+        self.controller._handling_pause = False
+        self.controller._force_quit_handler = RecordingForceQuitHandler()
+        self.controller.fuzzer = Mock()
+        self.controller.fuzzer.pause.return_value = True
+        self.controller.target_progress.directories = ["first/", "second/"]
+
+    def exercise_second_pause(self, first_option, second_option="c"):
+        with patch("builtins.input", side_effect=(first_option, second_option)):
+            self.controller.handle_pause()
+            self.controller.handle_pause()
+
+    def assert_pause_state_was_rearmed(self):
+        self.assertFalse(self.controller._handling_pause)
+        self.assertEqual(self.controller._force_quit_handler.force_quit_checks, 0)
+        self.assertEqual(self.controller._force_quit_handler.pause_starts, 2)
+        self.assertEqual(self.controller._force_quit_handler.resumes, 2)
+        self.assertEqual(self.controller.fuzzer.pause.call_count, 2)
+        self.controller.fuzzer.play.assert_called_once_with()
+
+    def test_next_directory_rearms_pause_for_every_engine(self):
+        engine_options = (
+            {"request_backend": "python", "async_mode": False},
+            {"request_backend": "python", "async_mode": True},
+            {"request_backend": "native", "async_mode": False},
+        )
+
+        for run_options in engine_options:
+            with self.subTest(options=run_options), patch.dict(
+                self.options,
+                {**run_options, "urls": ["https://example.test"]},
+            ):
+                self.reset_controller()
+                self.exercise_second_pause("n")
+                self.assert_pause_state_was_rearmed()
+                self.controller.fuzzer.quit.assert_called_once_with()
+
+    def test_quit_save_and_skip_follow_frozen_engine_after_flags_change(self):
+        for engine in ScanEngine:
+            for answers, error_type in (
+                (("q", "q"), QuitInterrupt),
+                (("q", "s", "checkpoint"), QuitInterrupt),
+                (("s",), SkipTargetInterrupt),
+            ):
+                with (
+                    self.subTest(engine=engine, answers=answers),
+                    patch.dict(self.options, {
+                        "urls": ["http://first.test/", "http://second.test/"],
+                        "session_file": None,
+                    }),
+                    patch("builtins.input", side_effect=answers),
+                ):
+                    self.reset_controller()
+                    self.controller.config = replace(self.controller.config, execution=ExecutionConfig(engine=engine))
+                    self.controller.pause_future = RecordingPauseFuture()
+                    self.controller._export = Mock()
+                    self.options.update(request_backend="python", async_mode=engine is not ScanEngine.ASYNC)
+                    if engine is ScanEngine.ASYNC:
+                        self.controller.handle_pause()
+                        self.assertIsInstance(self.controller.pause_future.error, error_type)
+                    else:
+                        with self.assertRaises(error_type):
+                            self.controller.handle_pause()
+                        self.assertIsNone(self.controller.pause_future.error)
+                    if answers == ("q", "s", "checkpoint"):
+                        self.controller._export.assert_called_once_with("checkpoint")
+                    else:
+                        self.controller._export.assert_not_called()
+
+    def test_skip_target_rearms_pause_for_threaded_and_native_engines(self):
+        for request_backend in ("python", "native"):
+            with self.subTest(request_backend=request_backend), patch.dict(
+                self.options,
+                {
+                    "request_backend": request_backend,
+                    "async_mode": False,
+                    "urls": ["https://first.test", "https://second.test"],
+                },
+            ), patch(
+                "builtins.input",
+                side_effect=("s", "c"),
+            ):
+                self.reset_controller()
+                with self.assertRaises(SkipTargetInterrupt):
+                    self.controller.handle_pause()
+                self.controller.handle_pause()
+
+                self.assert_pause_state_was_rearmed()
+                self.controller.fuzzer.quit.assert_not_called()
+
+    def test_save_prompt_and_typed_path_share_invocation_date_for_every_engine(self):
+        for engine in ScanEngine:
+            for entered in ("", "custom-{datetime}"):
+                with (
+                    self.subTest(engine=engine, entered=entered),
+                    patch.dict(self.options, {"session_file": "checkpoint-{datetime}"}),
+                    patch("builtins.input", side_effect=("q", "s", entered)),
+                    patch("time.strftime", return_value="2026-10-06 00:00:01"),
+                ):
+                    self.reset_controller()
+                    self.controller.config = replace(self.controller.config, execution=ExecutionConfig(engine=engine))
+                    self.controller.pause_future = RecordingPauseFuture()
+                    self.controller._export = Mock()
+                    if engine is ScanEngine.ASYNC:
+                        self.controller.handle_pause()
+                        self.assertIsInstance(self.controller.pause_future.error, QuitInterrupt)
+                    else:
+                        with self.assertRaises(QuitInterrupt):
+                            self.controller.handle_pause()
+                    self.controller.resources.interface.in_line.assert_any_call(
+                        "Save to file [checkpoint-2026-10-05_23-59-59]: "
+                    )
+                    prefix = "custom" if entered else "checkpoint"
+                    self.controller._export.assert_called_once_with(prefix + "-2026-10-05_23-59-59")
+
+    def test_skip_target_rearms_pause_for_async_engine(self):
+        with patch.dict(
+            self.options,
+            {
+                "request_backend": "python",
+                "async_mode": True,
+                "urls": ["https://first.test", "https://second.test"],
+            },
+        ):
+            self.reset_controller()
+            self.controller.pause_future = RecordingPauseFuture()
+            self.controller.config = replace(self.controller.config, execution=ExecutionConfig(engine=ScanEngine.ASYNC))
+            self.exercise_second_pause("s")
+
+        self.assertIsInstance(
+            self.controller.pause_future.error,
+            SkipTargetInterrupt,
+        )
+        self.assert_pause_state_was_rearmed()
+        self.controller.fuzzer.quit.assert_not_called()
+
+    def test_skip_uses_pending_state_even_if_source_urls_are_empty(self):
+        for engine in ScanEngine:
+            with (
+                self.subTest(engine=engine),
+                patch.dict(self.options, {"urls": []}),
+                patch("builtins.input", return_value="s"),
+            ):
+                self.reset_controller()
+                self.controller.config = replace(self.controller.config, execution=ExecutionConfig(engine=engine))
+                self.controller.pause_future = RecordingPauseFuture()
+                self.controller.run_state = ScanRunState(["first", "pending"])
+                self.controller.run_state.activate_next()
+                if engine is ScanEngine.ASYNC:
+                    self.controller.handle_pause()
+                    self.assertIsInstance(self.controller.pause_future.error, SkipTargetInterrupt)
+                else:
+                    with self.assertRaises(SkipTargetInterrupt):
+                        self.controller.handle_pause()
+                self.assertIn("[s]kip target", self.controller.resources.interface.in_line.call_args.args[0])
+                # The menu signals the exit; only run() finishes the attempt.
+                self.assertEqual(self.controller.run_state.active_task.target, "first")
+
+    def test_last_active_target_cannot_skip_to_stale_source_urls(self):
+        for engine in ScanEngine:
+            with (
+                self.subTest(engine=engine),
+                patch.dict(self.options, {"urls": ["stale", "also-stale"]}),
+                patch("builtins.input", side_effect=("s", "c")),
+            ):
+                self.reset_controller()
+                self.controller.config = replace(self.controller.config, execution=ExecutionConfig(engine=engine))
+                self.controller.run_state = ScanRunState(["last"])
+                self.controller.run_state.activate_next()
+                self.controller.handle_pause()
+                for call in self.controller.resources.interface.in_line.call_args_list:
+                    self.assertNotIn("[s]kip target", call.args[0])
+                self.controller.fuzzer.play.assert_called_once_with()

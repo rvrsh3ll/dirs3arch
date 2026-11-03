@@ -1,0 +1,141 @@
+from dataclasses import replace
+# -*- coding: utf-8 -*-
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 2 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program; if not, write to the Free Software
+#  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+#  MA 02110-1301, USA.
+#
+#  Author: Mauro Soria
+
+from unittest import TestCase
+from unittest.mock import Mock, call, patch
+
+from lib.core.run_config import RunConfig
+from lib.controller.run_resources import RunResources
+from lib.controller.controller import Controller
+from lib.core.target_progress import TargetProgress
+from lib.core.option_defaults import default_options
+from lib.core.exceptions import InvalidURLException
+from lib.core.target_config import TargetConfig
+
+
+class TestControllerTargetDNS(TestCase):
+    def setUp(self):
+        self.options = default_options()
+        self.options.update(
+            {
+                "request_backend": "python",
+                "scheme": None,
+                "ip": "192.0.2.10",
+                "proxies": [],
+                "tor": False,
+            }
+        )
+        self.controller = object.__new__(Controller)
+        self.controller._options = self.options
+        self.controller.resources = RunResources(interface=Mock(), logger=Mock())
+        self.controller.config = RunConfig(target=TargetConfig.from_options(self.options))
+        self.controller.target_progress = TargetProgress()
+        self.controller.resources.requester = Mock()
+
+    def test_ip_override_uses_detected_default_port(self):
+        with patch(
+            "lib.controller.controller.detect_scheme",
+            side_effect=(ValueError, "https"),
+        ) as detect_scheme:
+            self.controller.set_target("forced-origin.invalid")
+
+        self.assertEqual(
+            detect_scheme.call_args_list,
+            [
+                call(
+                    "forced-origin.invalid",
+                    None,
+                    connect_host="192.0.2.10",
+                ),
+                call(
+                    "forced-origin.invalid",
+                    443,
+                    connect_host="192.0.2.10",
+                ),
+            ],
+        )
+        self.controller.resources.requester.set_ip.assert_called_once_with(
+            "forced-origin.invalid",
+            443,
+            "192.0.2.10",
+        )
+        self.controller.resources.requester.set_url.assert_called_once_with(
+            "https://forced-origin.invalid/"
+        )
+
+    def test_proxy_or_tor_rejects_scheme_less_target_without_direct_probe(self):
+        routing_options = (
+            {"proxies": ["socks5h://127.0.0.1:9050"], "tor": False},
+            {"proxies": [], "tor": True},
+        )
+
+        for routing in routing_options:
+            with self.subTest(routing=routing):
+                self.options.update({"ip": None, "proxies": [], "tor": False})
+                self.options.update(routing)
+                self.controller.config = replace(self.controller.config, target=TargetConfig.from_options(self.options))
+                self.controller.resources.requester.reset_mock()
+
+                with patch(
+                    "lib.controller.controller.detect_scheme",
+                    return_value="https",
+                ) as detect_scheme, self.assertRaisesRegex(
+                    InvalidURLException,
+                    "Cannot auto-detect the scheme when using a proxy or Tor",
+                ):
+                    self.controller.set_target("user:secret@private.example")
+
+                detect_scheme.assert_not_called()
+                self.controller.resources.requester.set_auth.assert_not_called()
+                self.controller.resources.requester.set_url.assert_not_called()
+
+    def test_proxy_accepts_an_explicit_url_scheme(self):
+        self.options.update(
+            {
+                "ip": None,
+                "proxies": ["http://127.0.0.1:8080"],
+            }
+        )
+        self.controller.config = replace(self.controller.config, target=TargetConfig.from_options(self.options))
+
+        with patch("lib.controller.controller.detect_scheme") as detect_scheme:
+            self.controller.set_target("https://example.test")
+
+        detect_scheme.assert_not_called()
+        self.controller.resources.requester.set_url.assert_called_once_with(
+            "https://example.test/"
+        )
+
+    def test_proxy_accepts_scheme_option(self):
+        self.options.update(
+            {
+                "ip": None,
+                "proxies": ["http://127.0.0.1:8080"],
+                "scheme": "https",
+            }
+        )
+        self.controller.config = replace(self.controller.config, target=TargetConfig.from_options(self.options))
+
+        with patch("lib.controller.controller.detect_scheme") as detect_scheme:
+            self.controller.set_target("example.test")
+
+        detect_scheme.assert_not_called()
+        self.controller.resources.requester.set_url.assert_called_once_with(
+            "https://example.test/"
+        )

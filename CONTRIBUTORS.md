@@ -1,6 +1,5 @@
 # Contributors
 
-- [Mauro Soria](https://twitter.com/_maurosoria)
 - [Pham Sy Minh](https://github.com/shelld3v)
 - [Valerio Rico](https://github.com/V-Rico)
 - [Damian Strobel](https://twitter.com/damian_89_)
@@ -24,15 +23,16 @@
 - [Ricardo](https://github.com/ricardojba)
 - [Anon Exploiter](https://twitter.com/syed__umar)
 - [ColdFusionX](https://github.com/ColdFusionX)
-- [gdattacker](https://github.com/gauravdrago)
+- [gdattacker](https://github.com/GDATTACKER-RESEARCHER)
 - [Gaurav Yadav](http://chowmean.github.io/)
 - [Wyatt Dahlenburg](https://github.com/wdahlenburg)
 - [Alexandre ZANNI](https://github.com/noraj)
 - [Andrea Draghetti](https://github.com/drego85)
 - [Mohd Shahril](https://github.com/shahril96)
+- [mohamedsolaiman](https://github.com/mohamedsolaiman)
 - [Houziaux Mike](https://twitter.com/Jenaye_fr)
 - [Jannik Vieten](https://github.com/exploide)
-- [MiawOren](https://github.com/telnet22)
+- [MiawOren](https://github.com/0x0d3ad)
 - [sysEvil](https://github.com/sysevil)
 - [s-hamann](https://github.com/s-hamann)
 - [Ramin Farajpour Cami](https://twitter.com/MF4rr3ll)
@@ -59,12 +59,43 @@
 - [catmandx](https://github.com/catmandx)
 - [Kyle Nweeia](https://github.com/kyle-nweeia)
 - [Xib3rR4dAr](https://github.com/Xib3rR4dAr)
+- [Rohit Soni](https://github.com/StreetOfHackerR007/)
+- [Maxime Peim](https://github.com/maxime-peim)
+- [Christian Clauss](https://github.com/cclauss)
+- [Dipak Panchal](https://instagram.com/th3.d1p4k)
+- [Ivan Fedotov](https://github.com/qumusabel)
+- [Manuel Poisson](https://github.com/ManuelPOISSON)
+- [XinRoom](https://github.com/XinRoom)
+- [godspeedcurry](https://github.com/godspeedcurry)
+- [0x08](https://github.com/its0x08)
+- [Weltolk](https://github.com/Weltolk)
+- [at0m](https://github.com/atomiczsec/)
+- [junmoka](https://github.com/junmoka)
+- [Akshay Ravi](https://www.linkedin.com/in/c09yc47/)
+- [Maxence Zolnieurck](https://github.com/mxcezl)
+- [Giorgos Drosos](https://github.com/gdrosos)
+- [huyphan](https://github.com/huyphan)
+- [Sean Wei](https://www.sean.taipei/about-en)
+- [FantasqueX](https://www.github.com/FantasqueX)
+- [Ovi3](https://github.com/Ovi3)
+- [u21h2](https://www.github.com/u21h2)
+- [ajcriado](https://www.github.com/ajcriado)
+- [archdiote](https://www.github.com/archidote)
+- [jxdv](https://github.com/jxdv)
+- [Xeonacid](https://github.com/Xeonacid)
+- [Valentijn Scholten](https://www.github.com/valentijnscholten)
+- [partoneplay](https://github.com/partoneplay)
+- [xujiantop-crypto](https://github.com/xujiantop-crypto)
+- [mshzy](https://github.com/mshzy)
+- [ChrisJr404](https://github.com/ChrisJr404)
+- [liangzaihuanyv](https://github.com/liangzaihuanyv)
 
-Special thanks for all the people who had helped dirsearch so far!
+
+Special thanks to all the people who are named here!
 
 ### How can I help the project?
 - Bug fixes
-- Code updates (clean, features, workflow, ...)
-- Better documentation
-- Better default wordlist
+- Code contribution
+- Documentation improvement
+- Wordlist improvement
 - Feature requests

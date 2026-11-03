@@ -1,0 +1,45 @@
+# -*- coding: utf-8 -*-
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 2 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program; if not, write to the Free Software
+#  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+#  MA 02110-1301, USA.
+#
+#  Author: Mauro Soria
+
+from lib.core.decorators import locked
+from lib.core.settings import NEW_LINE
+from lib.report.factory import BaseReport, FileReportMixin
+
+
+class MarkdownReport(FileReportMixin, BaseReport):
+    __format__ = "markdown"
+    __extension__ = "md"
+
+    def new(self):
+        header = "### Information" + NEW_LINE
+        header += f"Command: {self.metadata.command}"
+        header += NEW_LINE
+        header += f"Time: {self.metadata.start_time}"
+        header += NEW_LINE * 2
+        header += "URL | Status | Size | Content Type | Redirection | Elapsed (ms)" + NEW_LINE
+        header += "----|--------|------|--------------|-------------|-------------" + NEW_LINE
+        return header
+
+    @locked
+    def save(self, file, result):
+        elapsed_ms = int(result.elapsed * 1000) if result.elapsed else "-"
+        row = (
+            f"{result.url} | {result.status} | {result.length} | "
+            f"{result.type} | {result.redirect} | {elapsed_ms}{NEW_LINE}"
+        )
+        self.append(file, row)

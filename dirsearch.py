@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#
 # -*- coding: utf-8 -*-
 #  This program is free software; you can redistribute it and/or modify
 #  it under the terms of the GNU General Public License as published by
@@ -17,31 +18,74 @@
 #
 #  Author: Mauro Soria
 
-import os
 import sys
 
-if sys.version_info < (3, 0):
-    sys.stdout.write("Sorry, dirsearch requires Python 3.x\n")
+from lib.core.api import (
+    DirsearchFuzzer,
+    FuzzerConfig,
+    FuzzerResult,
+    Wordlist,
+    WordlistState,
+    WordlistTemplate,
+)
+from lib.core.option_defaults import default_options
+from lib.core.exceptions import WordlistLimitError
+from lib.core.options import parse_options
+from lib.core.run_metadata import RunMetadata
+from lib.utils.cli import cli_interrupts, fail
+
+__all__ = [
+    "main",
+    "DirsearchFuzzer",
+    "FuzzerConfig",
+    "FuzzerResult",
+    "Wordlist",
+    "WordlistState",
+    "WordlistTemplate",
+]
+
+if sys.version_info < (3, 11):
+    sys.stderr.write("Sorry, dirsearch requires Python 3.11 or higher\n")
     sys.exit(1)
 
-from lib.core import ArgumentParser
-from lib.controller import Controller
-from lib.output import CLIOutput, PrintOutput
 
+def main():
+    metadata = RunMetadata.capture()
+    options = default_options()
+    options.update(parse_options())
 
-class Program(object):
-    def __init__(self):
-        self.script_path = os.path.dirname(os.path.realpath(__file__))
+    if options["wordlist_status"]:
+        from lib.core.dictionary import Dictionary
+        from lib.core.wordlist_config import WordlistConfig
 
-        self.arguments = ArgumentParser(self.script_path)
+        try:
+            dictionary = Dictionary(
+                WordlistConfig.from_options(options), files=options["wordlists"]
+            )
+        except WordlistLimitError as error:
+            fail(error)
 
-        if self.arguments.quiet:
-            self.output = PrintOutput(self.arguments.color)
-        else:
-            self.output = CLIOutput(self.arguments.color)
+        print("Wordlist status")
+        print(f"Files: {len(options['wordlists'])}")
+        for wordlist in options["wordlists"]:
+            print(f"- {wordlist}")
+        print(f"Generated entries: {len(dictionary)}")
+        print(f"Generation limit: {options['wordlist_max_size']}")
+        sys.exit(0)
 
-        self.controller = Controller(self.script_path, self.arguments, self.output)
+    if options["session_file"]:
+        print("Loading a session file will override current options.")
+        if input("[c]ontinue / [q]uit: ") != "c":
+            exit(1)
+
+    from lib.controller.controller import Controller
+
+    controller = Controller(options, metadata=metadata)
+    controller.run(interrupts=cli_interrupts(controller.handle_pause))
 
 
 if __name__ == "__main__":
-    main = Program()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
